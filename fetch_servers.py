@@ -3,6 +3,7 @@ import re
 import csv
 import json
 import time
+import shutil
 import socket
 import base64
 import threading
@@ -17,7 +18,10 @@ from playwright.sync_api import sync_playwright
 HEALTH_CHECK_TIMEOUT = float(os.environ.get("HEALTH_CHECK_TIMEOUT", "2.0"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
 MIN_SERVERS_THRESHOLD = int(os.environ.get("MIN_SERVERS_THRESHOLD", "5"))
-OUTPUT_FILE = "servers.json"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "dist")
+DATA_BRANCH = os.environ.get("DATA_BRANCH", "data")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "UrRaihanX/onevpn-api")
+CDN_BASE_URL = f"https://cdn.jsdelivr.net/gh/{GITHUB_REPOSITORY}@{DATA_BRANCH}"
 
 GITHUB_REPOS = [
     "https://api.github.com/repos/Zoult/.ovpn/contents/",
@@ -81,6 +85,11 @@ def country_code_to_flag_url(cc: str) -> str:
     if cleaned == "XX":
         return ""
     return f"https://flagcdn.com/w80/{cleaned.lower()}.png"
+
+
+def make_server_id(ip: str, port: int, proto: str) -> str:
+    """প্রতিটি সার্ভারের জন্য ইউনিক ও ফাইল-নিরাপদ ID তৈরি করে।"""
+    return f"{ip.replace('.', '_')}_{port}_{proto}"
 
 
 def is_valid_ipv4(host: str) -> bool:
@@ -148,7 +157,6 @@ def check_tcp_health(ip: str, port: int):
 
 def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
     """OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2 প্যাকেট পাঠিয়ে UDP সার্ভারের হেলথ চেক করে।"""
-    # Opcode 7 (P_CONTROL_HARD_RESET_CLIENT_V2) << 3 = 0x38 + 8-byte session ID + 5 zero bytes
     probe_packet = b"\x38" + os.urandom(8) + b"\x00\x00\x00\x00\x00"
     start_time = time.monotonic()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -161,10 +169,8 @@ def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
             ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
             return True, ping_ms
     except ConnectionRefusedError:
-        # ICMP Port Unreachable -> সার্ভার নিশ্চিতভাবে বন্ধ
         return False, None
     except socket.timeout:
-        # tls-auth/tls-crypt থাকলে আনসাইনড UDP প্রোব ড্রপ হতে পারে; একই পোর্টে TCP ফলব্যাক চেষ্টা করা হয়
         if has_tls_key:
             return check_tcp_health(ip, port)
         return False, None
@@ -363,7 +369,10 @@ def process_server(item):
     if not alive or ping_ms is None:
         return None
     cc = normalize_country_code(item["country_code"])
+    server_id = make_server_id(item["ip"], item["port"], item["protocol"])
+    config_path = f"configs/{server_id}.ovpn"
     return {
+        "id": server_id,
         "ip": item["ip"],
         "port": item["port"],
         "protocol": item["protocol"],
@@ -374,26 +383,55 @@ def process_server(item):
         "isp": "Unknown",
         "ping_ms": ping_ms,
         "source": item["source"],
-        "ovpn_base64": base64.b64encode(item["ovpn_text"].encode("utf-8")).decode("utf-8"),
+        "config_path": config_path,
+        "config_url": f"{CDN_BASE_URL}/{config_path}",
+        "_ovpn_text": item["ovpn_text"],
     }
 
 
-def load_existing_server_count(path: str) -> int:
-    if not os.path.exists(path):
-        return 0
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return int(data.get("total_servers", len(data.get("servers", []))))
-    except Exception:
-        return 0
+def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
+    """লাইটওয়েট servers_meta.json, আলাদা configs/*.ovpn এবং ব্যাকওয়ার্ড-কম্প্যাটিবল servers.json তৈরি করে।"""
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    configs_dir = os.path.join(output_dir, "configs")
+    os.makedirs(configs_dir, exist_ok=True)
 
+    now_unix = int(time.time())
+    meta_servers = []
+    full_servers = []
 
-def save_servers_atomically(output: dict, path: str) -> None:
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    for server in healthy_servers:
+        ovpn_text = server.pop("_ovpn_text")
+        ovpn_file = os.path.join(output_dir, server["config_path"])
+        with open(ovpn_file, "w", encoding="utf-8") as f:
+            f.write(ovpn_text)
+
+        meta_servers.append(server)
+        full_servers.append({
+            **server,
+            "ovpn_base64": base64.b64encode(ovpn_text.encode("utf-8")).decode("utf-8"),
+        })
+
+    meta_payload = {
+        "app": "OneVPN",
+        "last_updated_unix": now_unix,
+        "total_servers": len(meta_servers),
+        "cdn_base_url": CDN_BASE_URL,
+        "servers": meta_servers,
+    }
+    full_payload = {
+        "app": "OneVPN",
+        "last_updated_unix": now_unix,
+        "total_servers": len(full_servers),
+        "cdn_base_url": CDN_BASE_URL,
+        "servers": full_servers,
+    }
+
+    with open(os.path.join(output_dir, "servers_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f, separators=(",", ":"), ensure_ascii=False)
+
+    with open(os.path.join(output_dir, "servers.json"), "w", encoding="utf-8") as f:
+        json.dump(full_payload, f, separators=(",", ":"), ensure_ascii=False)
 
 
 def main():
@@ -406,7 +444,6 @@ def main():
     raw_counts = Counter(item["source"] for item in raw_candidates)
     print(f"Fetched raw candidates by source: {dict(raw_counts)}")
 
-    # (ip, port, protocol) অনুযায়ী ডুপ্লিকেট বাদ দেওয়া
     unique_map = {}
     for item in raw_candidates:
         ip, port, proto, has_tls_key = extract_server_endpoint(item["ovpn_text"])
@@ -428,13 +465,10 @@ def main():
     live_counts = Counter(s["source"] for s in healthy_servers)
     print(f"Live servers by source: {dict(live_counts)}")
 
-    # সেফটি গার্ড: সার্ভার সংখ্যা ন্যূনতম সীমার কম হলে আগের ভালো servers.json ওভাররাইট করা হবে না
-    existing_count = load_existing_server_count(OUTPUT_FILE)
-    if len(healthy_servers) < MIN_SERVERS_THRESHOLD and existing_count >= MIN_SERVERS_THRESHOLD:
+    if len(healthy_servers) < MIN_SERVERS_THRESHOLD:
         print(
             f"Safety guard triggered: only {len(healthy_servers)} live servers found "
-            f"(minimum required: {MIN_SERVERS_THRESHOLD}). Keeping existing {OUTPUT_FILE} "
-            f"with {existing_count} servers."
+            f"(minimum required: {MIN_SERVERS_THRESHOLD}). Skipping output generation."
         )
         return
 
@@ -442,16 +476,15 @@ def main():
     enrich_with_geoip(healthy_servers)
 
     healthy_servers.sort(key=lambda x: x["ping_ms"])
+    write_output_bundle(healthy_servers, OUTPUT_DIR)
 
-    output = {
-        "app": "OneVPN",
-        "last_updated_unix": int(time.time()),
-        "total_servers": len(healthy_servers),
-        "servers": healthy_servers,
-    }
-
-    save_servers_atomically(output, OUTPUT_FILE)
-    print(f"Done! Saved {len(healthy_servers)} live unique servers with GeoIP.")
+    meta_kb = os.path.getsize(os.path.join(OUTPUT_DIR, "servers_meta.json")) / 1024
+    full_kb = os.path.getsize(os.path.join(OUTPUT_DIR, "servers.json")) / 1024
+    print(
+        f"Done! Saved {len(healthy_servers)} servers -> "
+        f"servers_meta.json ({meta_kb:.1f} KB), servers.json ({full_kb:.1f} KB), "
+        f"and {len(healthy_servers)} individual .ovpn files in {OUTPUT_DIR}/configs/."
+    )
 
 
 if __name__ == "__main__":
