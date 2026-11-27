@@ -8,24 +8,31 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: update-onevpn-servers
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          playwright install chromium
+          playwright install --with-deps chromium
 
       - name: Fetch and Check VPN Servers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python fetch_servers.py
 
       - name: Save servers.json
@@ -33,5 +40,10 @@ jobs:
           git config --global user.name "OneVPN Bot"
           git config --global user.email "bot@onevpn.local"
           git add servers.json
-          git diff --staged --quiet || git commit -m "Auto-update OneVPN servers"
-          git push
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-update OneVPN servers"
+            git pull --rebase
+            git push
+          else
+            echo "No changes in servers.json; skipping commit."
+          fi
