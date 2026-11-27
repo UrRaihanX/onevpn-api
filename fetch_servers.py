@@ -153,7 +153,7 @@ def check_tcp_health(ip: str, port: int):
             sock.settimeout(HEALTH_CHECK_TIMEOUT)
             # TCP transport frames each OpenVPN packet with a 2-byte network-order length.
             session_id = os.urandom(8)
-            packet = b"\x38" + session_id + b"\x00\x00\x00\\x01\x00"
+            packet = b"\x38" + session_id + b"\x00\x00\x00\x01\x00"
             sock.sendall(len(packet).to_bytes(2, "big") + packet)
 
             header = b""
