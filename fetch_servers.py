@@ -296,7 +296,6 @@ def fetch_simple_sites():
     session.headers.update(HEADERS)
 
     for site in SIMPLE_SCRAPE_SITES:
-        page_urls = [site["url"]]
         for attempt in range(3):
             try:
                 res = session.get(site["url"], timeout=20)
