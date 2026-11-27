@@ -146,9 +146,39 @@ def extract_server_endpoint(ovpn_text: str):
 
 
 def check_tcp_health(ip: str, port: int):
+    """Require an OpenVPN TCP control-channel response, not merely an open TCP port."""
     start_time = time.monotonic()
     try:
-        with socket.create_connection((ip, port), timeout=HEALTH_CHECK_TIMEOUT):
+        with socket.create_connection((ip, port), timeout=HEALTH_CHECK_TIMEOUT) as sock:
+            sock.settimeout(HEALTH_CHECK_TIMEOUT)
+            # TCP transport frames each OpenVPN packet with a 2-byte network-order length.
+            session_id = os.urandom(8)
+            packet = b"\\x38" + session_id + b"\\x00\\x00\\x00\\x01\\x00"
+            sock.sendall(len(packet).to_bytes(2, "big") + packet)
+
+            header = b""
+            while len(header) < 2:
+                chunk = sock.recv(2 - len(header))
+                if not chunk:
+                    return False, None
+                header += chunk
+
+            response_length = int.from_bytes(header, "big")
+            if response_length < 1 or response_length > 4096:
+                return False, None
+
+            response = b""
+            while len(response) < response_length:
+                chunk = sock.recv(response_length - len(response))
+                if not chunk:
+                    return False, None
+                response += chunk
+
+            # Server hard-reset or control packet: evidence of an OpenVPN listener.
+            opcode = (response[0] >> 3) & 0x1F
+            if opcode not in (4, 8):
+                return False, None
+
             ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
             return True, ping_ms
     except Exception:
