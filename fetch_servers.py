@@ -167,7 +167,7 @@ def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
         # opcode/key-id, 8-byte session-id, 4-byte packet-id, ack-count.
         session_id = os.urandom(8)
         for packet_id in range(1, 4):
-            probe_packet = b"\\x38" + session_id + packet_id.to_bytes(4, "big") + b"\\x00"
+            probe_packet = b"\x38" + session_id + packet_id.to_bytes(4, "big") + b"\x00"
             try:
                 sock.send(probe_packet)
                 data = sock.recv(2048)
