@@ -28,7 +28,7 @@ GITHUB_REPOS = [
 ]
 
 SIMPLE_SCRAPE_SITES = [
-    {"name": "IPSpeed", "url": "https://ipspeed.info/freevpn_openvpn.php"},
+    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php"},
     {"name": "OpenProxyList", "url": "https://openproxylist.com/openvpn/"},
 ]
 
@@ -146,40 +146,75 @@ def extract_server_endpoint(ovpn_text: str):
 
 
 def check_tcp_health(ip: str, port: int):
+    """Require an OpenVPN TCP control-channel response, not merely an open TCP port."""
     start_time = time.monotonic()
     try:
-        with socket.create_connection((ip, port), timeout=HEALTH_CHECK_TIMEOUT):
+        with socket.create_connection((ip, port), timeout=HEALTH_CHECK_TIMEOUT) as sock:
+            sock.settimeout(HEALTH_CHECK_TIMEOUT)
+            # TCP transport frames each OpenVPN packet with a 2-byte network-order length.
+            session_id = os.urandom(8)
+            packet = b"\x38" + session_id + b"\x00\x00\x00\x01\x00"
+            sock.sendall(len(packet).to_bytes(2, "big") + packet)
+
+            header = b""
+            while len(header) < 2:
+                chunk = sock.recv(2 - len(header))
+                if not chunk:
+                    return False, None
+                header += chunk
+
+            response_length = int.from_bytes(header, "big")
+            if response_length < 1 or response_length > 4096:
+                return False, None
+
+            response = b""
+            while len(response) < response_length:
+                chunk = sock.recv(response_length - len(response))
+                if not chunk:
+                    return False, None
+                response += chunk
+
+            # Server hard-reset or control packet: evidence of an OpenVPN listener.
+            opcode = (response[0] >> 3) & 0x1F
+            if opcode not in (4, 8):
+                return False, None
+
             ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
             return True, ping_ms
     except Exception:
         return False, None
 
 
+
 def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
-    """OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2 প্যাকেট পাঠিয়ে UDP সার্ভারের হেলথ চেক করে।"""
-    probe_packet = b"\x38" + os.urandom(8) + b"\x00\x00\x00\x00\x00"
+    """OpenVPN UDP control-channel probe; retry before declaring the endpoint unreachable."""
     start_time = time.monotonic()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(HEALTH_CHECK_TIMEOUT)
+    sock.settimeout(min(HEALTH_CHECK_TIMEOUT, 1.5))
     try:
         sock.connect((ip, port))
-        sock.send(probe_packet)
-        data = sock.recv(1024)
-        if data:
-            ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
-            return True, ping_ms
-    except ConnectionRefusedError:
-        return False, None
-    except socket.timeout:
-        if has_tls_key:
-            return check_tcp_health(ip, port)
-        return False, None
+        # OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2:
+        # opcode/key-id, 8-byte session-id, 4-byte packet-id, ack-count.
+        session_id = os.urandom(8)
+        for packet_id in range(1, 4):
+            probe_packet = b"\x38" + session_id + packet_id.to_bytes(4, "big") + b"\x00"
+            try:
+                sock.send(probe_packet)
+                data = sock.recv(2048)
+                if data and ((data[0] >> 3) & 0x1F) in (4, 8):
+                    ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
+                    return True, ping_ms
+            except socket.timeout:
+                if packet_id < 3:
+                    continue
+                return False, None
+            except ConnectionRefusedError:
+                return False, None
     except Exception:
         return False, None
     finally:
         sock.close()
     return False, None
-
 
 def check_server_health(ip: str, port: int, proto: str, has_tls_key: bool = False):
     if proto == "tcp":
@@ -283,81 +318,173 @@ def fetch_github():
     return candidates
 
 
-def fetch_simple_sites():
-    candidates = []
-    for site in SIMPLE_SCRAPE_SITES:
-        try:
-            res = requests.get(site["url"], headers=HEADERS, timeout=15)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-            ovpn_urls = list({
-                urljoin(site["url"], a["href"])
-                for a in soup.find_all("a", href=True)
-                if ".ovpn" in a["href"].lower()
-            })[:20]
 
-            for url in ovpn_urls:
-                try:
-                    file_res = requests.get(url, headers=HEADERS, timeout=10)
-                    if file_res.status_code == 200 and "remote " in file_res.text:
-                        candidates.append({
-                            "ovpn_text": file_res.text,
-                            "country": "Unknown",
-                            "country_code": "XX",
-                            "source": site["name"],
-                        })
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"{site['name']} Error: {e}")
+def fetch_simple_sites():
+    """Fetch direct .ovpn links from static source pages with bounded retries."""
+    candidates = []
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    for site in SIMPLE_SCRAPE_SITES:
+        for attempt in range(3):
+            try:
+                res = session.get(site["url"], timeout=20)
+                if res.status_code in (403, 429, 500, 502, 503, 504):
+                    print(f"{site['name']} source temporarily unavailable (HTTP {res.status_code}), attempt {attempt + 1}/3")
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    break
+                res.raise_for_status()
+                soup = BeautifulSoup(res.text, "html.parser")
+                links = set()
+
+                for a in soup.find_all("a", href=True):
+                    href = urljoin(res.url, a["href"].strip())
+                    label = a.get_text(" ", strip=True).lower()
+                    if (
+                        ".ovpn" in href.lower()
+                        or ".ovpn" in label
+                        or any(word in label for word in ("download", "config", "openvpn"))
+                        or any(word in href.lower() for word in ("download", "config", "profile"))
+                    ):
+                        links.add(href)
+
+                for element in soup.select("[data-href], [data-url], [data-download-url], [data-download]"):
+                    for attr in ("data-href", "data-url", "data-download-url", "data-download"):
+                        value = element.get(attr)
+                        if value:
+                            links.add(urljoin(res.url, value.strip()))
+
+                for url in list(links)[:40]:
+                    try:
+                        file_res = session.get(url, timeout=15)
+                        if not file_res.ok:
+                            continue
+                        body = file_res.text.lstrip("\ufeff")
+                        if "remote " in body.lower() and ("dev tun" in body.lower() or "dev tap" in body.lower()):
+                            candidates.append({
+                                "ovpn_text": body,
+                                "country": "Unknown",
+                                "country_code": "XX",
+                                "source": site["name"],
+                            })
+                    except Exception as e:
+                        print(f"{site['name']} download error: {e}")
+                print(f"{site['name']}: collected {sum(1 for c in candidates if c['source'] == site['name'])} configs")
+                break
+            except Exception as e:
+                print(f"{site['name']} Error (attempt {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
     return candidates
 
 
 def fetch_with_playwright():
+    """Collect rendered download links and inspect detail pages for downloadable profiles."""
     candidates = []
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = context.new_page()
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                accept_downloads=True,
+            )
 
             for site in BROWSER_SCRAPE_SITES:
+                page = context.new_page()
                 try:
                     print(f"Opening {site['name']} in browser...")
-                    page.goto(site["url"], wait_until="networkidle", timeout=30000)
-                    page.wait_for_timeout(3000)
+                    response = page.goto(site["url"], wait_until="domcontentloaded", timeout=45000)
+                    if response and response.status >= 400:
+                        print(f"{site['name']} page returned HTTP {response.status}")
+                        continue
+                    page.wait_for_timeout(2500)
 
-                    links = page.eval_on_selector_all(
-                        "a[href]",
-                        "elements => elements.map(el => el.href)",
-                    )
-                    ovpn_urls = list({
-                        url for url in links
-                        if ".ovpn" in url.lower() or "download" in url.lower()
-                    })[:20]
+                    extracted = page.evaluate("""() => {
+                      const out = [];
+                      for (const el of document.querySelectorAll('a[href],button,[data-url],[data-href],[data-download-url]')) {
+                        const attrs = ['href','data-url','data-href','data-download-url','data-download','onclick'];
+                        const values = attrs.map(k => el.getAttribute(k)).filter(Boolean);
+                        out.push({text: (el.innerText || el.textContent || '').trim(), values});
+                      }
+                      for (const script of document.scripts) {
+                        if (script.textContent) out.push({text:'script', values:[script.textContent]});
+                      }
+                      return out;
+                    }""")
 
-                    for url in ovpn_urls:
+                    urls = set()
+                    for item in extracted:
+                        label = (item.get("text") or "").lower()
+                        for value in item.get("values", []):
+                            for match in re.findall(r"""(?:https?://[^\s"'<>\\]+|/(?:[^\s"'<>\\]*?(?:download|config|profile|\.ovpn)[^\s"'<>\\]*))""", value, re.I):
+                                clean = match.rstrip("),;]")
+                                if clean.startswith("/"):
+                                    clean = urljoin(site["url"], clean)
+                                if clean.startswith(("http://", "https://")):
+                                    urls.add(clean)
+                            if value.startswith(("http://", "https://")):
+                                urls.add(value)
+                        # Some sites expose server-detail pages whose download action is rendered there.
+                        if any(word in label for word in ("download", "connect", "details", "view server")):
+                            for value in item.get("values", []):
+                                if value.startswith("/") or value.startswith("http"):
+                                    urls.add(urljoin(site["url"], value))
+
+                    # Inspect a bounded number of candidate pages; only accept actual OpenVPN profiles.
+                    checked = 0
+                    for url in list(urls)[:100]:
+                        if checked >= 60:
+                            break
+                        checked += 1
                         try:
-                            response = context.request.get(url, timeout=10000)
-                            if response.ok:
-                                text = response.text()
-                                if "remote " in text and "dev " in text:
-                                    candidates.append({
-                                        "ovpn_text": text,
-                                        "country": "Unknown",
-                                        "country_code": "XX",
-                                        "source": site["name"],
-                                    })
-                        except Exception:
-                            continue
+                            result = context.request.get(url, timeout=15000)
+                            if not result.ok:
+                                continue
+                            body = result.text().lstrip("\ufeff")
+                            if "remote " in body.lower() and ("dev tun" in body.lower() or "dev tap" in body.lower()):
+                                candidates.append({
+                                    "ovpn_text": body,
+                                    "country": "Unknown",
+                                    "country_code": "XX",
+                                    "source": site["name"],
+                                })
+                                continue
+
+                            # A detail page may contain the final download link.
+                            if "<html" in body[:500].lower() or "<!doctype" in body[:500].lower():
+                                detail = BeautifulSoup(body, "html.parser")
+                                for anchor in detail.find_all("a", href=True):
+                                    href = urljoin(url, anchor["href"].strip())
+                                    text = anchor.get_text(" ", strip=True).lower()
+                                    if ".ovpn" in href.lower() or any(w in text for w in ("download", "config")):
+                                        try:
+                                            file_result = context.request.get(href, timeout=12000)
+                                            if file_result.ok:
+                                                config = file_result.text().lstrip("\ufeff")
+                                                if "remote " in config.lower() and ("dev tun" in config.lower() or "dev tap" in config.lower()):
+                                                    candidates.append({
+                                                        "ovpn_text": config,
+                                                        "country": "Unknown",
+                                                        "country_code": "XX",
+                                                        "source": site["name"],
+                                                    })
+                                        except Exception:
+                                            continue
+                        except Exception as e:
+                            print(f"{site['name']} candidate error: {e}")
+
+                    print(f"{site['name']}: collected {sum(1 for c in candidates if c['source'] == site['name'])} configs from {checked} candidate URLs")
                 except Exception as e:
                     print(f"Playwright Error ({site['name']}): {e}")
+                finally:
+                    page.close()
 
             browser.close()
     except Exception as e:
         print(f"Browser Launch Error: {e}")
     return candidates
-
 
 def process_server(item):
     alive, ping_ms = check_server_health(
