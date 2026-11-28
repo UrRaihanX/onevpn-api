@@ -1008,6 +1008,24 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
         if os.path.exists(staging_dir): shutil.rmtree(staging_dir, ignore_errors=True)
 
 
+def deduplicate_candidates(raw_candidates):
+    """Keep one record per endpoint, preferring first-party approved providers."""
+    source_priority = {"vpngate": 0, "riseup": 1, "calyx": 2, "fox3000foxy/ovpn-configs-scraper": 3}
+    unique_map = {}
+    for item in raw_candidates:
+        ip, port, proto, has_tls_key = extract_server_endpoint(item["ovpn_text"])
+        if not ip:
+            continue
+        key = (ip, port, proto)
+        item.update({"ip": ip, "port": port, "protocol": proto, "has_tls_key": has_tls_key})
+        previous = unique_map.get(key)
+        priority = source_priority.get(str(item.get("source", "")).lower(), 99)
+        old_priority = source_priority.get(str(previous.get("source", "")).lower(), 100) if previous else 100
+        if previous is None or priority < old_priority:
+            unique_map[key] = item
+    return unique_map
+
+
 def main():
     raw_candidates = []
     source_fetchers = [
@@ -1036,17 +1054,7 @@ def main():
     raw_counts = Counter(item["source"] for item in raw_candidates)
     print(f"Fetched raw candidates by source: {dict(raw_counts)}")
 
-    source_priority = {"vpngate": 0, "riseup": 1, "calyx": 2, "fox3000foxy/ovpn-configs-scraper": 3}
-    unique_map = {}
-    for item in raw_candidates:
-        ip, port, proto, has_tls_key = extract_server_endpoint(item["ovpn_text"])
-        if not ip: continue
-        key = (ip, port, proto)
-        item.update({"ip": ip, "port": port, "protocol": proto, "has_tls_key": has_tls_key})
-        previous = unique_map.get(key)
-        priority = source_priority.get(str(item.get("source", "")).lower(), 99)
-        old_priority = source_priority.get(str(previous.get("source", "")).lower(), 100) if previous else 100
-        if previous is None or priority < old_priority: unique_map[key] = item
+    unique_map = deduplicate_candidates(raw_candidates)
 
     print(f"Checking health for {len(unique_map)} unique endpoints (TCP + UDP)...")
     healthy_servers = []

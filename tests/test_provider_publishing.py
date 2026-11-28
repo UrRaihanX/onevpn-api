@@ -105,16 +105,14 @@ KEY
         self.assertEqual(results[0]["speed_mbps"], 25.0)
 
     def test_endpoint_deduplication_prefers_approved_source(self):
-        # Same endpoint identity is shared across provider sources.
-        endpoints = [("198.51.100.1", 1194, "udp", "fox3000foxy/OVPN-Configs-scraper"),
-                     ("198.51.100.1", 1194, "udp", "VPNGate")]
-        priority = {"vpngate": 0, "riseup": 1, "calyx": 2, "fox3000foxy/ovpn-configs-scraper": 3}
-        chosen = {}
-        for ip, port, proto, source in endpoints:
-            key = (ip, port, proto)
-            if key not in chosen or priority[source.lower()] < priority[chosen[key].lower()]:
-                chosen[key] = source
-        self.assertEqual(chosen[("198.51.100.1", 1194, "udp")], "VPNGate")
+        profile = "client\\nremote 198.51.100.1 1194 udp\\n"
+        records = [
+            {"ovpn_text": profile, "source": "fox3000foxy/OVPN-Configs-scraper"},
+            {"ovpn_text": profile, "source": "VPNGate"},
+        ]
+        unique = fetch_servers.deduplicate_candidates(records)
+        self.assertEqual(len(unique), 1)
+        self.assertEqual(next(iter(unique.values()))["source"], "VPNGate")
 
     def test_aes_256_cbc_is_preserved(self):
         patched = fetch_servers.patch_ovpn_config("client\n", False)
