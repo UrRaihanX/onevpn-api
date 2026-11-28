@@ -907,9 +907,7 @@ def run_end_to_end_checks(healthy_servers: list):
         candidates = sorted(candidates, key=lambda server: server.get("ping_ms", float("inf")))
         checked += 1
         protocol_passed = False
-        attempted_ids = set()
         for server in candidates[:2]:
-            attempted_ids.add(server.get("id"))
             ok, detail = run_openvpn_end_to_end(server)
             print(f"{source.upper()} E2E {'PASS' if ok else 'ATTEMPT FAILED'}: "
                   f"{proto.upper()} {server['ip']}:{server['port']} - {detail}")
