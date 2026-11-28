@@ -681,66 +681,37 @@ def run_end_to_end_checks(healthy_servers: list):
     passed = 0
     checked = 0
 
-    # Riseup's /3/cert key is shared by all gateway candidates from this API
-    # response. Use it only in ephemeral CI test files, never in public output.
-    riseup_checked = set()
-    for server in healthy_servers:
-        if server.get("source") != "riseup":
-            continue
-        proto = server["protocol"]
-        if proto not in {"tcp", "udp"} or proto in riseup_checked:
-            continue
-        riseup_checked.add(proto)
-        checked += 1
-        ok, detail = run_openvpn_end_to_end(server)
-        print(
-            f"RISEUP E2E {'PASS' if ok else 'FAIL'}: "
-            f"{proto.upper()} {server['ip']}:{server['port']} - {detail}"
-        )
-        if ok:
-            passed += 1
-        if len(riseup_checked) == 2:
-            break
-    if not riseup_checked:
-        print("RISEUP E2E SKIPPED: no health-checked Riseup TCP/UDP endpoints were available.")
-
-    # Test multiple public endpoints per protocol. A TCP listener can pass the
-    # lightweight control-channel probe but still reject a full OpenVPN session.
-    # One stale/broken endpoint must not hide other working servers in the feed.
-    public_by_protocol = {"tcp": [], "udp": []}
+    # Exercise each provider independently so one provider's success cannot mask
+    # broken credentials, endpoint metadata, or profile generation from another.
+    grouped = {}
     for server in healthy_servers:
         if not server.get("_publishable", True):
             continue
-        proto = server["protocol"]
-        if proto in public_by_protocol:
-            public_by_protocol[proto].append(server)
+        key = (str(server.get("source", "")).lower(), server.get("protocol"))
+        if key[1] in {"tcp", "udp"}:
+            grouped.setdefault(key, []).append(server)
 
-    max_attempts_per_protocol = 3
-    for proto, candidates in public_by_protocol.items():
-        if not candidates:
-            print(f"VPN E2E SKIPPED: no publishable {proto.upper()} endpoints were health-checked.")
-            continue
-
+    for (source, proto), candidates in sorted(grouped.items()):
         checked += 1
         protocol_passed = False
-        for server in candidates[:max_attempts_per_protocol]:
+        for server in candidates[:2]:
             ok, detail = run_openvpn_end_to_end(server)
-            print(
-                f"VPN E2E {'PASS' if ok else 'ATTEMPT FAILED'}: {server['source']} "
-                f"{proto.upper()} {server['ip']}:{server['port']} - {detail}"
-            )
+            print(f"{source.upper()} E2E {'PASS' if ok else 'ATTEMPT FAILED'}: "
+                  f"{proto.upper()} {server['ip']}:{server['port']} - {detail}")
             if ok:
                 passed += 1
                 protocol_passed = True
                 break
-
         if not protocol_passed:
-            print(
-                f"VPN E2E FAIL: no working public {proto.upper()} tunnel found "
-                f"in {min(len(candidates), max_attempts_per_protocol)} attempted endpoint(s)."
-            )
+            print(f"{source.upper()} E2E FAIL: no working {proto.upper()} tunnel "
+                  f"found in {min(len(candidates), 2)} attempted endpoint(s).")
 
-    print(f"VPN E2E summary: {passed}/{checked} protocol checks passed (Riseup isolated + public-source regression).")
+    expected_sources = {"vpngate", "riseup", "calyx"}
+    present_sources = {source for source, _ in grouped}
+    missing_sources = expected_sources - present_sources
+    for source in sorted(missing_sources):
+        print(f"{source.upper()} E2E SKIPPED: no health-checked publishable endpoints.")
+    print(f"VPN E2E summary: {passed}/{checked} provider/protocol checks passed.")
 
 def process_server(item):
     alive, ping_ms = check_server_health(
