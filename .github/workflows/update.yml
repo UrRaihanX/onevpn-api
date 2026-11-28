@@ -29,6 +29,9 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Validate Python syntax
+        run: python -m py_compile fetch_servers.py
+
       - name: Fetch and Check VPN Servers
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,3 +68,6 @@ jobs:
           fi
           curl -fsSL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/servers_meta.json" || true
           curl -fsSL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/servers.json" || true
+          jq -r '.servers[].config_path' dist/servers_meta.json | while read -r config_path; do
+            curl -fsSL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/$config_path" >/dev/null || true
+          done
