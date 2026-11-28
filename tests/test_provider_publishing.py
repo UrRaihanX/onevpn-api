@@ -64,7 +64,7 @@ class ProviderPublishingTests(unittest.TestCase):
              mock.patch.object(fetch_servers,"install_openvpn_client",return_value=True), \
              mock.patch.object(fetch_servers,"run_openvpn_end_to_end",
                  side_effect=lambda item: (item["protocol"] == "tcp",
-                     "verified" if item["protocol"] == "tcp" else "AUTH_FAILED: invalid certificate") as attempt:
+                     "verified" if item["protocol"] == "tcp" else "AUTH_FAILED: invalid certificate")) as attempt:
             result=fetch_servers.run_end_to_end_checks(broken+[survivor])
         self.assertEqual([x["id"] for x in result],[survivor["id"]])
         self.assertEqual(attempt.call_count,4)
