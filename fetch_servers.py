@@ -38,7 +38,7 @@ SIMPLE_SCRAPE_SITES = [
 # and enforce that limit. HuntVPN and PublicVPNList require approved access
 # before automated collection or permanent republication.
 BROWSER_SCRAPE_SITES = [
-    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php"},
+    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php", "fallback_urls": ["https://ipspeed.info/tr/free-openvpn.php", "https://ipspeed.info/es/free-openvpn.php"]},
 ]
 
 POLICY_RESTRICTED_SOURCES = {
@@ -406,9 +406,26 @@ def fetch_with_playwright():
                 page = context.new_page()
                 try:
                     print(f"Opening {site['name']} in browser...")
-                    response = page.goto(site["url"], wait_until="domcontentloaded", timeout=45000)
-                    if response and response.status >= 400:
-                        print(f"{site['name']} page returned HTTP {response.status}")
+                    page_url = None
+                    for candidate_page_url in [site["url"], *site.get("fallback_urls", [])]:
+                        try:
+                            response = page.goto(candidate_page_url, wait_until="domcontentloaded", timeout=45000)
+                        except Exception as exc:
+                            print(f"{site['name']} page navigation failed for {candidate_page_url}: {exc}")
+                            continue
+                        if response and response.status >= 400:
+                            headers = response.headers
+                            print(
+                                f"{site['name']} page returned HTTP {response.status} "
+                                f"(server={headers.get('server', 'unknown')}, "
+                                f"content-type={headers.get('content-type', 'unknown')}, "
+                                f"retry-after={headers.get('retry-after', 'none')})"
+                            )
+                            continue
+                        page_url = candidate_page_url
+                        break
+                    if not page_url:
+                        print(f"{site['name']}: all published language pages rejected the CI browser request; source needs provider-side access approval or allowlisting.")
                         continue
                     page.wait_for_timeout(2500)
 
@@ -432,7 +449,7 @@ def fetch_with_playwright():
                             for match in re.findall(r"""(?:https?://[^\s"'<>\\]+|/(?:[^\s"'<>\\]*?(?:download|config|profile|\.ovpn)[^\s"'<>\\]*))""", value, re.I):
                                 clean = match.rstrip("),;]")
                                 if clean.startswith("/"):
-                                    clean = urljoin(site["url"], clean)
+                                    clean = urljoin(page_url, clean)
                                 if clean.startswith(("http://", "https://")):
                                     urls.add(clean)
                             if value.startswith(("http://", "https://")):
@@ -441,7 +458,7 @@ def fetch_with_playwright():
                         if any(word in label for word in ("download", "connect", "details", "view server")):
                             for value in item.get("values", []):
                                 if value.startswith("/") or value.startswith("http"):
-                                    urls.add(urljoin(site["url"], value))
+                                    urls.add(urljoin(page_url, value))
 
                     # Prefer direct .ovpn links. IPSpeed limits profile downloads to
                     # one every 10 seconds; cap each run to six profiles and honour it.
@@ -613,6 +630,15 @@ def run_openvpn_end_to_end(item: dict):
         pid_path = os.path.join(temp_dir, "openvpn.pid")
         with open(config_path, "w", encoding="utf-8") as handle:
             handle.write(profile)
+        # Pre-create the log as the runner user so the non-root Python process
+        # can read it after OpenVPN (started via sudo) writes to the same file.
+        with open(log_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(log_path, 0o666)
+        # Keep the PID file runner-readable for reliable cleanup of the sudo child.
+        with open(pid_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(pid_path, 0o666)
 
         process = None
         route_ip = None
