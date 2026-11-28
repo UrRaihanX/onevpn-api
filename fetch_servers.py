@@ -726,26 +726,43 @@ def run_end_to_end_checks(healthy_servers: list):
     if not riseup_checked:
         print("RISEUP E2E SKIPPED: no health-checked Riseup TCP/UDP endpoints were available.")
 
-    # Retain the existing independent TCP/UDP regression checks for publishable sources.
-    checked_protocols = set()
+    # Test multiple public endpoints per protocol. A TCP listener can pass the
+    # lightweight control-channel probe but still reject a full OpenVPN session.
+    # One stale/broken endpoint must not hide other working servers in the feed.
+    public_by_protocol = {"tcp": [], "udp": []}
     for server in healthy_servers:
         if not server.get("_publishable", True):
             continue
         proto = server["protocol"]
-        if proto not in {"tcp", "udp"} or proto in checked_protocols:
+        if proto in public_by_protocol:
+            public_by_protocol[proto].append(server)
+
+    max_attempts_per_protocol = 3
+    for proto, candidates in public_by_protocol.items():
+        if not candidates:
+            print(f"VPN E2E SKIPPED: no publishable {proto.upper()} endpoints were health-checked.")
             continue
-        checked_protocols.add(proto)
+
         checked += 1
-        ok, detail = run_openvpn_end_to_end(server)
-        print(
-            f"VPN E2E {'PASS' if ok else 'FAIL'}: {server['source']} "
-            f"{proto.upper()} {server['ip']}:{server['port']} - {detail}"
-        )
-        if ok:
-            passed += 1
-        if len(checked_protocols) >= 2:
-            break
-    print(f"VPN E2E summary: {passed}/{checked} tunnel checks passed (Riseup isolated + public-source regression).")
+        protocol_passed = False
+        for server in candidates[:max_attempts_per_protocol]:
+            ok, detail = run_openvpn_end_to_end(server)
+            print(
+                f"VPN E2E {'PASS' if ok else 'ATTEMPT FAILED'}: {server['source']} "
+                f"{proto.upper()} {server['ip']}:{server['port']} - {detail}"
+            )
+            if ok:
+                passed += 1
+                protocol_passed = True
+                break
+
+        if not protocol_passed:
+            print(
+                f"VPN E2E FAIL: no working public {proto.upper()} tunnel found "
+                f"in {min(len(candidates), max_attempts_per_protocol)} attempted endpoint(s)."
+            )
+
+    print(f"VPN E2E summary: {passed}/{checked} protocol checks passed (Riseup isolated + public-source regression).")
 
 def process_server(item):
     alive, ping_ms = check_server_health(
