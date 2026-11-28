@@ -799,6 +799,22 @@ def process_server(item):
 
 def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     """লাইটওয়েট servers_meta.json, আলাদা configs/*.ovpn এবং ব্যাকওয়ার্ড-কম্প্যাটিবল servers.json তৈরি করে।"""
+    # Fail closed before touching the existing output: only explicitly approved
+    # public sources may be published, and private-key material is never allowed.
+    for server in healthy_servers:
+        source = str(server.get("source", "")).strip().lower()
+        if source != "vpngate" or not server.get("_publishable", True):
+            raise ValueError(
+                f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
+            )
+        ovpn_text = str(server.get("_ovpn_text", ""))
+        if re.search(
+            r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----|<key>\\s*-----BEGIN",
+            ovpn_text,
+            re.IGNORECASE,
+        ):
+            raise ValueError("Refusing to publish an OpenVPN profile containing private-key material")
+
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     configs_dir = os.path.join(output_dir, "configs")
