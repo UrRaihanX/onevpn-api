@@ -6,6 +6,8 @@ import time
 import shutil
 import socket
 import base64
+import hashlib
+import ssl
 import threading
 import subprocess
 import tempfile
@@ -343,8 +345,8 @@ def fetch_vpngate():
 
 
 
-def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, source_slug: str):
-    """Fetch Bitmask v3 credentials using the provider CA and build OpenVPN profiles."""
+def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, source_slug: str, ca_fingerprint: str = ""):
+    """Fetch Bitmask v3 credentials, pin the provider CA, and build OpenVPN profiles."""
     candidates = []
     api = api_base.rstrip("/")
     try:
@@ -353,9 +355,15 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
         ca_pem = ca_response.text.strip()
         if "BEGIN CERTIFICATE" not in ca_pem:
             raise ValueError(f"{provider_name} CA endpoint did not return a PEM certificate")
+        if ca_fingerprint:
+            actual_fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(ca_pem)).hexdigest()
+            expected_fingerprint = ca_fingerprint.lower().removeprefix("sha256:").replace(":", "").strip()
+            if actual_fingerprint.lower() != expected_fingerprint:
+                raise ValueError(f"{provider_name} provider CA fingerprint mismatch")
 
-        # Bitmask providers may use a private provider CA for their API TLS
-        # certificate. Trust that CA explicitly for both API requests.
+        # The provider CA authenticates the VPN server/client certificates inside
+        # the generated OpenVPN profile. The provider API itself currently uses
+        # a publicly trusted HTTPS certificate, so requests must use system roots.
         with tempfile.TemporaryDirectory(prefix=f"onevpn-{source_slug}-ca-") as temp_dir:
             ca_path = os.path.join(temp_dir, "provider-ca.pem")
             with open(ca_path, "w", encoding="utf-8") as handle:
@@ -363,7 +371,7 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
 
             gateways_response = requests.get(
                 f"{api}/3/config/eip-service.json", headers=HEADERS,
-                timeout=30, verify=ca_path,
+                timeout=30,
             )
             gateways_response.raise_for_status()
             service = gateways_response.json()
@@ -445,7 +453,8 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
 
 def fetch_riseup():
     return fetch_bitmask_provider("RiseupVPN", "https://api.black.riseup.net",
-                                  "https://black.riseup.net/ca.crt", "riseup")
+                                  "https://black.riseup.net/ca.crt", "riseup",
+                                  "SHA256:825fe0695d0134e7b7c80dd624cf33780d8e5e7fbd782ca0c8a87e24e108b468")
 
 
 def fetch_calyx():
