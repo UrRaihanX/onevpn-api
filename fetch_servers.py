@@ -380,7 +380,7 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
                 raise ValueError(f"{provider_name} API returned no gateways")
 
             cert_response = requests.get(
-                f"{api}/3/cert", headers=HEADERS, timeout=30, verify=ca_path,
+                f"{api}/3/cert", headers=HEADERS, timeout=30,
             )
             cert_response.raise_for_status()
             bundle = cert_response.text
