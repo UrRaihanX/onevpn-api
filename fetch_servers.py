@@ -7,6 +7,9 @@ import shutil
 import socket
 import base64
 import threading
+import subprocess
+import tempfile
+import ipaddress
 import requests
 from io import StringIO
 from collections import Counter
@@ -28,14 +31,20 @@ GITHUB_REPOS = [
 ]
 
 SIMPLE_SCRAPE_SITES = [
-    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php"},
     {"name": "OpenProxyList", "url": "https://openproxylist.com/openvpn/"},
 ]
 
+# IPSpeed permits one profile download every 10 seconds. Use a browser session
+# and enforce that limit. HuntVPN and PublicVPNList require approved access
+# before automated collection or permanent republication.
 BROWSER_SCRAPE_SITES = [
-    {"name": "HuntVPN", "url": "https://huntvpn.dev/servers"},
-    {"name": "PublicVPNList", "url": "https://publicvpnlist.com/openvpn-configs/"},
+    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php"},
 ]
+
+POLICY_RESTRICTED_SOURCES = {
+    "HuntVPN": "automated scraping and mirroring are prohibited by the site's terms",
+    "PublicVPNList": "API access requires an issued key and permanent automated mirroring is prohibited",
+}
 
 HEADERS = {
     "User-Agent": (
@@ -381,8 +390,10 @@ def fetch_simple_sites():
 
 
 def fetch_with_playwright():
-    """Collect rendered download links and inspect detail pages for downloadable profiles."""
+    """Collect IPSpeed profiles through a browser while respecting its download limit."""
     candidates = []
+    for source_name, reason in POLICY_RESTRICTED_SOURCES.items():
+        print(f"{source_name}: skipped; {reason}. Request approved bulk access before enabling.")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -432,14 +443,31 @@ def fetch_with_playwright():
                                 if value.startswith("/") or value.startswith("http"):
                                     urls.add(urljoin(site["url"], value))
 
-                    # Inspect a bounded number of candidate pages; only accept actual OpenVPN profiles.
+                    # Prefer direct .ovpn links. IPSpeed limits profile downloads to
+                    # one every 10 seconds; cap each run to six profiles and honour it.
+                    candidate_urls = sorted(
+                        urls,
+                        key=lambda value: (".ovpn" not in value.lower(), value),
+                    )
+                    if site["name"] == "IPSpeed":
+                        candidate_urls = [u for u in candidate_urls if ".ovpn" in u.lower()][:6]
+                    else:
+                        candidate_urls = candidate_urls[:60]
+
                     checked = 0
-                    for url in list(urls)[:100]:
+                    last_download_at = None
+                    for url in candidate_urls:
                         if checked >= 60:
                             break
+                        if site["name"] == "IPSpeed" and last_download_at is not None:
+                            delay = 10.0 - (time.monotonic() - last_download_at)
+                            if delay > 0:
+                                time.sleep(delay)
                         checked += 1
                         try:
-                            result = context.request.get(url, timeout=15000)
+                            result = context.request.get(url, timeout=20000)
+                            if site["name"] == "IPSpeed":
+                                last_download_at = time.monotonic()
                             if not result.ok:
                                 continue
                             body = result.text().lstrip("\ufeff")
