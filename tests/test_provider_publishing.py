@@ -134,6 +134,7 @@ KEY
         patched = fetch_servers.patch_ovpn_config("client\ncipher AES-128-CBC\n", False)
         self.assertIn("data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305", patched)
         self.assertIn("data-ciphers-fallback AES-128-CBC", patched)
+
     def test_leap_provider_emits_both_udp_and_tcp_profiles(self):
         provider = mock.Mock()
         provider.json.return_value = {
@@ -141,7 +142,7 @@ KEY
             "api_version": "3",
             "ca_cert_uri": "https://riseup.example/ca.crt",
         }
-        ca = mock.Mock(text="-----BEGIN CERTIFICATE-----\\nCA\\n-----END CERTIFICATE-----")
+        ca = mock.Mock(text="-----BEGIN CERTIFICATE-----\nCA\n-----END CERTIFICATE-----")
         gateways = mock.Mock()
         gateways.json.return_value = {
             "gateways": [{
@@ -157,8 +158,8 @@ KEY
             "openvpn_configuration": {},
         }
         cert = mock.Mock(text=(
-            "-----BEGIN CERTIFICATE-----\\nCLIENT\\n-----END CERTIFICATE-----\\n"
-            "-----BEGIN PRIVATE KEY-----\\nKEY\\n-----END PRIVATE KEY-----"
+            "-----BEGIN CERTIFICATE-----\nCLIENT\n-----END CERTIFICATE-----\n"
+            "-----BEGIN PRIVATE KEY-----\nKEY\n-----END PRIVATE KEY-----"
         ))
         for response in (provider, ca, gateways, cert):
             response.raise_for_status.return_value = None
