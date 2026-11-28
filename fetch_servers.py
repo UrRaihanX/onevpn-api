@@ -614,7 +614,7 @@ def fetch_fox3000foxy():
 
 def install_openvpn_client():
     """Install OpenVPN on an ephemeral CI runner if it is not already available."""
-    if shutil.which("openvpn"):
+    if all(shutil.which(binary) for binary in ("openvpn", "ip", "curl")):
         return True
     if not shutil.which("sudo") or not shutil.which("apt-get"):
         print("VPN E2E skipped: OpenVPN CLI is unavailable on this runner.")
