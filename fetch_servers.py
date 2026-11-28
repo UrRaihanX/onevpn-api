@@ -702,7 +702,7 @@ def run_openvpn_end_to_end(item: dict):
                 capture_output=True, text=True, timeout=5,
             )
             if route_check.returncode != 0 or not re.search(
-                rf"\\bdev\\s+{re.escape(tun_device)}\\b", route_check.stdout
+                rf"\bdev\s+{re.escape(tun_device)}\b", route_check.stdout
             ):
                 route_detail = route_check.stdout.strip() or route_check.stderr.strip()
                 return False, (
