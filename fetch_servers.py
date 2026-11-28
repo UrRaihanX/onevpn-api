@@ -442,15 +442,29 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
             capabilities = gateway.get("capabilities", {}) or {}
             transports = capabilities.get("transport", []) or []
             openvpn_transports = [item for item in transports if str(item.get("type", "")).lower() == "openvpn"]
-            if openvpn_transports:
-                merged_protocols = []
-                merged_ports = []
+            selected_transport = None
+            for preferred_proto in ("udp", "tcp"):
                 for item in openvpn_transports:
                     values = item.get("protocols") or [item.get("protocol", "")]
-                    merged_protocols.extend(str(value).lower() for value in values if str(value).lower() in {"udp", "tcp"})
+                    protocols = [str(value).lower() for value in values]
+                    if preferred_proto not in protocols:
+                        continue
                     ports = item.get("ports", []) or []
-                    merged_ports.extend(ports if isinstance(ports, list) else [ports])
-                transports = [{"type": "openvpn", "protocols": merged_protocols, "ports": merged_ports}]
+                    ports = ports if isinstance(ports, list) else [ports]
+                    valid_ports = []
+                    for value in ports:
+                        try:
+                            port = int(value)
+                            if 1 <= port <= 65535:
+                                valid_ports.append(port)
+                        except (TypeError, ValueError):
+                            continue
+                    if valid_ports:
+                        selected_transport = {"type": "openvpn", "protocols": [preferred_proto], "ports": valid_ports}
+                        break
+                if selected_transport:
+                    break
+            transports = [selected_transport] if selected_transport else []
             for transport in transports:
                 if str(transport.get("type", "")).lower() != "openvpn":
                     continue
