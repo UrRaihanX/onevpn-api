@@ -13,10 +13,7 @@ import ipaddress
 import requests
 from io import StringIO
 from collections import Counter
-from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 HEALTH_CHECK_TIMEOUT = float(os.environ.get("HEALTH_CHECK_TIMEOUT", "2.0"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
@@ -25,22 +22,6 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "dist")
 DATA_BRANCH = os.environ.get("DATA_BRANCH", "data")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "UrRaihanX/onevpn-api")
 CDN_BASE_URL = f"https://cdn.jsdelivr.net/gh/{GITHUB_REPOSITORY}@{DATA_BRANCH}"
-
-SIMPLE_SCRAPE_SITES = [
-    {"name": "OpenProxyList", "url": "https://openproxylist.com/openvpn/"},
-]
-
-# IPSpeed permits one profile download every 10 seconds. Use a browser session
-# and enforce that limit. HuntVPN and PublicVPNList require approved access
-# before automated collection or permanent republication.
-BROWSER_SCRAPE_SITES = [
-    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php", "fallback_urls": ["https://ipspeed.info/tr/free-openvpn.php", "https://ipspeed.info/es/free-openvpn.php"]},
-]
-
-POLICY_RESTRICTED_SOURCES = {
-    "HuntVPN": "automated scraping and mirroring are prohibited by the site's terms",
-    "PublicVPNList": "API access requires an issued key and permanent automated mirroring is prohibited",
-}
 
 HEADERS = {
     "User-Agent": (
@@ -465,210 +446,6 @@ def fetch_riseup():
     return candidates
 
 
-def fetch_simple_sites():
-    """Fetch direct .ovpn links from static source pages with bounded retries."""
-    candidates = []
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    for site in SIMPLE_SCRAPE_SITES:
-        for attempt in range(3):
-            try:
-                res = session.get(site["url"], timeout=20)
-                if res.status_code in (403, 429, 500, 502, 503, 504):
-                    print(f"{site['name']} source temporarily unavailable (HTTP {res.status_code}), attempt {attempt + 1}/3")
-                    if attempt < 2:
-                        time.sleep(1.5 * (attempt + 1))
-                        continue
-                    break
-                res.raise_for_status()
-                soup = BeautifulSoup(res.text, "html.parser")
-                links = set()
-
-                for a in soup.find_all("a", href=True):
-                    href = urljoin(res.url, a["href"].strip())
-                    label = a.get_text(" ", strip=True).lower()
-                    if (
-                        ".ovpn" in href.lower()
-                        or ".ovpn" in label
-                        or any(word in label for word in ("download", "config", "openvpn"))
-                        or any(word in href.lower() for word in ("download", "config", "profile"))
-                    ):
-                        links.add(href)
-
-                for element in soup.select("[data-href], [data-url], [data-download-url], [data-download]"):
-                    for attr in ("data-href", "data-url", "data-download-url", "data-download"):
-                        value = element.get(attr)
-                        if value:
-                            links.add(urljoin(res.url, value.strip()))
-
-                for url in list(links)[:40]:
-                    try:
-                        file_res = session.get(url, timeout=15)
-                        if not file_res.ok:
-                            continue
-                        body = file_res.text.lstrip("\ufeff")
-                        if "remote " in body.lower() and ("dev tun" in body.lower() or "dev tap" in body.lower()):
-                            candidates.append({
-                                "ovpn_text": body,
-                                "country": "Unknown",
-                                "country_code": "XX",
-                                "source": site["name"],
-                            })
-                    except Exception as e:
-                        print(f"{site['name']} download error: {e}")
-                print(f"{site['name']}: collected {sum(1 for c in candidates if c['source'] == site['name'])} configs")
-                break
-            except Exception as e:
-                print(f"{site['name']} Error (attempt {attempt + 1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-    return candidates
-
-
-def fetch_with_playwright():
-    """Collect IPSpeed profiles through a browser while respecting its download limit."""
-    candidates = []
-    for source_name, reason in POLICY_RESTRICTED_SOURCES.items():
-        print(f"{source_name}: skipped; {reason}. Request approved bulk access before enabling.")
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                accept_downloads=True,
-            )
-
-            for site in BROWSER_SCRAPE_SITES:
-                page = context.new_page()
-                try:
-                    print(f"Opening {site['name']} in browser...")
-                    page_url = None
-                    for candidate_page_url in [site["url"], *site.get("fallback_urls", [])]:
-                        try:
-                            response = page.goto(candidate_page_url, wait_until="domcontentloaded", timeout=45000)
-                        except Exception as exc:
-                            print(f"{site['name']} page navigation failed for {candidate_page_url}: {exc}")
-                            continue
-                        if response and response.status >= 400:
-                            headers = response.headers
-                            print(
-                                f"{site['name']} page returned HTTP {response.status} "
-                                f"(server={headers.get('server', 'unknown')}, "
-                                f"content-type={headers.get('content-type', 'unknown')}, "
-                                f"retry-after={headers.get('retry-after', 'none')})"
-                            )
-                            continue
-                        page_url = candidate_page_url
-                        break
-                    if not page_url:
-                        print(f"{site['name']}: all published language pages rejected the CI browser request; source needs provider-side access approval or allowlisting.")
-                        continue
-                    page.wait_for_timeout(2500)
-
-                    extracted = page.evaluate("""() => {
-                      const out = [];
-                      for (const el of document.querySelectorAll('a[href],button,[data-url],[data-href],[data-download-url]')) {
-                        const attrs = ['href','data-url','data-href','data-download-url','data-download','onclick'];
-                        const values = attrs.map(k => el.getAttribute(k)).filter(Boolean);
-                        out.push({text: (el.innerText || el.textContent || '').trim(), values});
-                      }
-                      for (const script of document.scripts) {
-                        if (script.textContent) out.push({text:'script', values:[script.textContent]});
-                      }
-                      return out;
-                    }""")
-
-                    urls = set()
-                    for item in extracted:
-                        label = (item.get("text") or "").lower()
-                        for value in item.get("values", []):
-                            for match in re.findall(r"""(?:https?://[^\s"'<>\\]+|/(?:[^\s"'<>\\]*?(?:download|config|profile|\.ovpn)[^\s"'<>\\]*))""", value, re.I):
-                                clean = match.rstrip("),;]")
-                                if clean.startswith("/"):
-                                    clean = urljoin(page_url, clean)
-                                if clean.startswith(("http://", "https://")):
-                                    urls.add(clean)
-                            if value.startswith(("http://", "https://")):
-                                urls.add(value)
-                        # Some sites expose server-detail pages whose download action is rendered there.
-                        if any(word in label for word in ("download", "connect", "details", "view server")):
-                            for value in item.get("values", []):
-                                if value.startswith("/") or value.startswith("http"):
-                                    urls.add(urljoin(page_url, value))
-
-                    # Prefer direct .ovpn links. IPSpeed limits profile downloads to
-                    # one every 10 seconds; cap each run to six profiles and honour it.
-                    candidate_urls = sorted(
-                        urls,
-                        key=lambda value: (".ovpn" not in value.lower(), value),
-                    )
-                    if site["name"] == "IPSpeed":
-                        candidate_urls = [u for u in candidate_urls if ".ovpn" in u.lower()][:6]
-                    else:
-                        candidate_urls = candidate_urls[:60]
-
-                    checked = 0
-                    last_download_at = None
-                    for url in candidate_urls:
-                        if checked >= 60:
-                            break
-                        if site["name"] == "IPSpeed" and last_download_at is not None:
-                            delay = 10.0 - (time.monotonic() - last_download_at)
-                            if delay > 0:
-                                time.sleep(delay)
-                        checked += 1
-                        try:
-                            result = context.request.get(url, timeout=20000)
-                            if site["name"] == "IPSpeed":
-                                last_download_at = time.monotonic()
-                            if not result.ok:
-                                continue
-                            body = result.text().lstrip("\ufeff")
-                            if "remote " in body.lower() and ("dev tun" in body.lower() or "dev tap" in body.lower()):
-                                candidates.append({
-                                    "ovpn_text": body,
-                                    "country": "Unknown",
-                                    "country_code": "XX",
-                                    "source": site["name"],
-                                })
-                                continue
-
-                            # A detail page may contain the final download link.
-                            if "<html" in body[:500].lower() or "<!doctype" in body[:500].lower():
-                                detail = BeautifulSoup(body, "html.parser")
-                                for anchor in detail.find_all("a", href=True):
-                                    href = urljoin(url, anchor["href"].strip())
-                                    text = anchor.get_text(" ", strip=True).lower()
-                                    if ".ovpn" in href.lower() or any(w in text for w in ("download", "config")):
-                                        try:
-                                            file_result = context.request.get(href, timeout=12000)
-                                            if file_result.ok:
-                                                config = file_result.text().lstrip("\ufeff")
-                                                if "remote " in config.lower() and ("dev tun" in config.lower() or "dev tap" in config.lower()):
-                                                    candidates.append({
-                                                        "ovpn_text": config,
-                                                        "country": "Unknown",
-                                                        "country_code": "XX",
-                                                        "source": site["name"],
-                                                    })
-                                        except Exception:
-                                            continue
-                        except Exception as e:
-                            print(f"{site['name']} candidate error: {e}")
-
-                    print(f"{site['name']}: collected {sum(1 for c in candidates if c['source'] == site['name'])} configs from {checked} candidate URLs")
-                except Exception as e:
-                    print(f"Playwright Error ({site['name']}): {e}")
-                finally:
-                    page.close()
-
-            browser.close()
-    except Exception as e:
-        print(f"Browser Launch Error: {e}")
-    return candidates
-
-
 def install_openvpn_client():
     """Install OpenVPN on an ephemeral CI runner if it is not already available."""
     if shutil.which("openvpn"):
@@ -1056,8 +833,6 @@ def main():
     source_fetchers = [
         ("VPNGate", fetch_vpngate),
         ("RiseupVPN", fetch_riseup),
-        ("OpenProxyList", fetch_simple_sites),
-        ("IPSpeed", fetch_with_playwright),
     ]
     for source_name, fetcher in source_fetchers:
         try:
