@@ -360,75 +360,6 @@ def fetch_vpngate():
 
 
 
-def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
-    """Normalize third-party profiles for modern OpenVPN and Android openvpn_flutter."""
-    output = []
-    skip_inline_auth = False
-    seen = set()
-    removed = {"script-security", "up", "down", "block-outside-dns", "register-dns"}
-    for raw_line in ovpn_text.splitlines():
-        stripped = raw_line.strip()
-        if skip_inline_auth:
-            if stripped.lower() == "</auth-user-pass>":
-                skip_inline_auth = False
-            continue
-        if not stripped or stripped.startswith(("#", ";")):
-            output.append(raw_line)
-            continue
-        if stripped.lower() == "<auth-user-pass>":
-            skip_inline_auth = True
-            continue
-        parts = stripped.split(None, 1)
-        directive = parts[0].lower()
-        if directive == "auth-user-pass":
-            continue
-        if directive in removed:
-            continue
-        if directive in {"data-ciphers", "data-ciphers-fallback"}:
-            if directive not in seen:
-                # Use the requested compatibility set consistently across providers.
-                value = (
-                    "AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"
-                    if directive == "data-ciphers"
-                    else "AES-128-CBC"
-                )
-                output.append(f"{directive} {value}")
-                seen.add(directive)
-            continue
-        output.append(raw_line)
-        seen.add(directive)
-
-    required = [
-        ('data-ciphers', "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"),
-        ('data-ciphers-fallback', "data-ciphers-fallback AES-128-CBC"),
-        ('pull-filter-route-ipv6', 'pull-filter ignore "route-ipv6"'),
-        ('pull-filter-ifconfig-ipv6', 'pull-filter ignore "ifconfig-ipv6"'),
-        ('dhcp-option-dns-1.1.1.1', "dhcp-option DNS 1.1.1.1"),
-        ('dhcp-option-dns-8.8.8.8', "dhcp-option DNS 8.8.8.8"),
-        ('persist-key', "persist-key"),
-        ('persist-tun', "persist-tun"),
-    ]
-    existing = set()
-    for line in output:
-        value = line.strip().lower()
-        if value.startswith("pull-filter ignore") and "route-ipv6" in value:
-            existing.add('pull-filter-route-ipv6')
-        elif value.startswith("pull-filter ignore") and "ifconfig-ipv6" in value:
-            existing.add('pull-filter-ifconfig-ipv6')
-        elif value == "dhcp-option dns 1.1.1.1":
-            existing.add('dhcp-option-dns-1.1.1.1')
-        elif value == "dhcp-option dns 8.8.8.8":
-            existing.add('dhcp-option-dns-8.8.8.8')
-        elif value in {"persist-key", "persist-tun"}:
-            existing.add(value)
-    for key, line in required:
-        if key not in existing and not (key in seen):
-            output.append(line)
-    if requires_auth:
-        output.append("auth-user-pass")
-    return "\n".join(output).rstrip() + "\n"
-
-
 def fetch_riseup():
     """Fetch Riseup's official LEAP API and create self-contained OpenVPN profiles."""
     candidates = []
@@ -607,8 +538,6 @@ def fetch_vpnbook():
         print(f"VPNBook Error: {exc}")
     return candidates
 
-
-def fetch_simple_sites():
 
 def fetch_simple_sites():
     """Fetch direct .ovpn links from static source pages with bounded retries."""
@@ -1163,7 +1092,7 @@ def main():
             fetched = fetcher()
             for candidate in fetched:
                 candidate["requires_auth"] = bool(candidate.get("requires_auth", re.search(
-                    r"(?im)^\\s*auth-user-pass(?:\\s|$)", candidate.get("ovpn_text", "")
+                    r"(?im)^\s*auth-user-pass(?:\s|$)", candidate.get("ovpn_text", "")
                 )))
                 candidate.setdefault("username", "")
                 candidate.setdefault("password", "")
