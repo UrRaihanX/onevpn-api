@@ -864,6 +864,16 @@ def main():
         )
         return
 
+    source_counts = Counter(str(server.get("source", "")).lower() for server in publishable_servers)
+    required_sources = {"vpngate", "riseup", "calyx"}
+    missing_sources = required_sources - set(source_counts)
+    if missing_sources:
+        print(
+            "Safety guard triggered: at least one approved source has no live profiles "
+            f"({', '.join(sorted(missing_sources))}). Keeping the previous public feed."
+        )
+        return
+
     print(f"Running GeoIP lookup for {len(publishable_servers)} publishable live servers...")
     enrich_with_geoip(publishable_servers)
 
