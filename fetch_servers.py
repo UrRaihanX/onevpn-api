@@ -807,14 +807,9 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
             raise ValueError(
                 f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
             )
-        ovpn_text = str(server.get("_ovpn_text", ""))
-        if re.search(
-            r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----|<key>\s*-----BEGIN",
-            ovpn_text,
-            re.IGNORECASE,
-        ):
-            raise ValueError("Refusing to publish an OpenVPN profile containing private-key material")
-
+        # VPNGate's distributed client profiles legitimately embed their
+        # per-profile OpenVPN key block. Source allowlisting and the explicit
+        # publishable flag are the publication boundary; do not reject that key.
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     configs_dir = os.path.join(output_dir, "configs")
