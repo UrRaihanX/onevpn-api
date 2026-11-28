@@ -800,7 +800,8 @@ def process_server(item):
 def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     """লাইটওয়েট servers_meta.json, আলাদা configs/*.ovpn এবং ব্যাকওয়ার্ড-কম্প্যাটিবল servers.json তৈরি করে।"""
     # Fail closed before touching the existing output: only explicitly approved
-    # public sources may be published, and private-key material is never allowed.
+    # public sources may be published. VPNGate's own client key blocks are required
+    # parts of its distributed profiles and are allowed for that source only.
     for server in healthy_servers:
         source = str(server.get("source", "")).strip().lower()
         if source != "vpngate" or not server.get("_publishable", True):
