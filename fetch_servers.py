@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 HEALTH_CHECK_TIMEOUT = float(os.environ.get("HEALTH_CHECK_TIMEOUT", "2.0"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
 MIN_SERVERS_THRESHOLD = int(os.environ.get("MIN_SERVERS_THRESHOLD", "5"))
+MAX_PING_MS = int(os.environ.get("MAX_PING_MS", "800"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "dist")
 DATA_BRANCH = os.environ.get("DATA_BRANCH", "data")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "UrRaihanX/onevpn-api")
@@ -183,17 +184,16 @@ def check_tcp_health(ip: str, port: int, has_tls_key: bool = False):
 
 
 def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
-    """OpenVPN UDP control-channel probe; retry before declaring the endpoint unreachable."""
+    """Check UDP reachability without treating a successful send as a response."""
+    if has_tls_key:
+        # Riseup advertises TCP and UDP on the same gateway port (notably 53).
+        # A real TCP connect provides measured RTT; UDP send success proves nothing.
+        return check_tcp_health(ip, port, has_tls_key=True)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(min(HEALTH_CHECK_TIMEOUT, 1.5))
     try:
         sock.connect((ip, port))
-        # TLS-keyed servers silently discard unauthenticated hard resets.
-        # Their authenticated profiles are verified by the OpenVPN E2E check.
-        if has_tls_key:
-            started = time.monotonic()
-            sock.send(b"\x38" + os.urandom(8) + b"\x00" + (1).to_bytes(4, "big"))
-            return True, max(1, int((time.monotonic() - started) * 1000))
         session_id = os.urandom(8)
         for packet_id in range(1, 4):
             start_time = time.monotonic()
@@ -379,15 +379,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
             provider_response.raise_for_status()
             provider = provider_response.json()
         except Exception:
-            if source_slug != "calyx":
-                raise
-            # Calyx's legacy provider.json currently returns 404; retain its
-            # documented LEAP API bootstrap endpoints as a fallback.
-            provider = {
-                "api_uri": "https://api.calyx.net:4430",
-                "api_version": "3",
-                "ca_cert_uri": "https://calyx.net/ca.crt",
-            }
+            raise
 
         api_uri = str(provider["api_uri"]).rstrip("/")
         api_version = str(provider.get("api_version", "3") or "3").strip("/")
@@ -562,12 +554,6 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
 def fetch_riseup():
     return fetch_leap_provider(
         "RiseupVPN", "https://riseup.net/provider.json", "riseup"
-    )
-
-
-def fetch_calyx():
-    return fetch_leap_provider(
-        "CalyxVPN", "https://calyx.net/provider.json", "calyx"
     )
 
 
@@ -878,7 +864,7 @@ def run_openvpn_end_to_end(item: dict):
 
 
 def run_end_to_end_checks(healthy_servers: list):
-    """Test one real TCP and one real UDP tunnel when candidates are available."""
+    """Verify each publishable source/protocol pair; exclude entirely broken groups."""
     if os.environ.get("RUN_E2E_TESTS", "1").strip().lower() in {"0", "false", "no"}:
         print("VPN E2E checks disabled by RUN_E2E_TESTS.")
         return healthy_servers
@@ -888,57 +874,56 @@ def run_end_to_end_checks(healthy_servers: list):
     if not install_openvpn_client():
         print("VPN E2E checks skipped because the OpenVPN client is unavailable; continuing other sources.")
         return healthy_servers
-
-    passed = 0
-    checked = 0
-    failed_server_ids = set()
-
-    # Exercise each provider independently so one provider's success cannot mask
-    # broken credentials, endpoint metadata, or profile generation from another.
     grouped = {}
     for server in healthy_servers:
-        if not server.get("_publishable", True):
-            continue
-        key = (str(server.get("source", "")).lower(), server.get("protocol"))
-        if key[1] in {"tcp", "udp"}:
+        if server.get("_publishable", True) and server.get("protocol") in {"tcp", "udp"}:
+            key = (str(server.get("source", "")).lower(), server["protocol"])
             grouped.setdefault(key, []).append(server)
-
+    passed = checked = 0
+    failed_ids, failed_groups = set(), set()
     for (source, proto), candidates in sorted(grouped.items()):
-        candidates = sorted(candidates, key=lambda server: server.get("ping_ms", float("inf")))
+        candidates = sorted(candidates, key=lambda x: x.get("ping_ms", float("inf")))
         checked += 1
+        attempted = candidates[:4]
         protocol_passed = False
-        for server in candidates[:2]:
+        reasons = []
+        for server in attempted:
             ok, detail = run_openvpn_end_to_end(server)
-            print(f"{source.upper()} E2E {'PASS' if ok else 'ATTEMPT FAILED'}: "
-                  f"{proto.upper()} {server['ip']}:{server['port']} - {detail}")
-            if not ok:
-                failed_server_ids.add(server.get("id"))
+            print(f"{source.upper()} E2E {'PASS' if ok else 'ATTEMPT FAILED'}: {proto.upper()} "
+                  f"{server['ip']}:{server['port']} - {detail}")
             if ok:
                 passed += 1
                 protocol_passed = True
                 break
+            failed_ids.add(server.get("id"))
+            reasons.append(f"{server['ip']}:{server['port']}: {detail}")
         if not protocol_passed:
-            print(f"{source.upper()} E2E FAIL: no working {proto.upper()} tunnel "
-                  f"found in {min(len(candidates), 2)} attempted endpoint(s).")
-
-    # Make missing protocol coverage explicit instead of silently omitting it.
-    expected_sources = {
-        "vpngate": "VPNGate",
-        "riseup": "RiseupVPN",
-        "calyx": "CalyxVPN",
-        "fox3000foxy/ovpn-configs-scraper": "Scraped",
-    }
-    for source, label in expected_sources.items():
-        for proto in ("tcp", "udp"):
-            if (source, proto) not in grouped:
+            failed_groups.add((source, proto))
+            print(f"{source.upper()} E2E GROUP EXCLUDED: {proto.upper()} all {len(attempted)} "
+                  f"attempted candidate(s) failed. Reason: {'; '.join(reasons) or 'no candidates'}")
+    expected = {"vpngate":"VPNGate","riseup":"RiseupVPN",
+                "fox3000foxy/ovpn-configs-scraper":"Scraped"}
+    for source,label in expected.items():
+        for proto in ("tcp","udp"):
+            if (source,proto) not in grouped:
                 print(f"{label} E2E {proto.upper()}: NOT AVAILABLE (no health-checked profile)")
-
     print(f"VPN E2E summary: {passed}/{checked} available provider/protocol checks passed.")
-    if failed_server_ids:
-        before = len(healthy_servers)
-        healthy_servers = [server for server in healthy_servers if server.get("id") not in failed_server_ids]
-        print(f"Excluded {before - len(healthy_servers)} individual profiles that failed E2E checks.")
+    before = len(healthy_servers)
+    healthy_servers = [server for server in healthy_servers
+        if (str(server.get("source","")).lower(),server.get("protocol")) not in failed_groups
+        and server.get("id") not in failed_ids]
+    if before != len(healthy_servers):
+        print(f"Excluded {before-len(healthy_servers)} profile(s), including every member of "
+              f"{len(failed_groups)} source/protocol group(s) that failed E2E.")
     return healthy_servers
+
+
+def filter_max_ping_servers(servers: list):
+    """Keep only records with a measured ping at or below MAX_PING_MS."""
+    kept=[x for x in servers if isinstance(x.get("ping_ms"),(int,float)) and 0 < x["ping_ms"] <= MAX_PING_MS]
+    if len(kept) != len(servers):
+        print(f"Excluded {len(servers)-len(kept)} server(s) above MAX_PING_MS={MAX_PING_MS} or without valid latency.")
+    return kept
 
 def process_server(item):
     alive, ping_ms = check_server_health(
@@ -978,11 +963,11 @@ def process_server(item):
 
 def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     """লাইটওয়েট servers_meta.json, আলাদা configs/*.ovpn এবং ব্যাকওয়ার্ড-কম্প্যাটিবল servers.json তৈরি করে।"""
-    # Fail closed before touching the existing output. These three providers are
-    # approved for public .ovpn distribution; Bitmask credentials refresh each run.
+    # Fail closed before touching the existing output. Only three providers are approved.
+    healthy_servers = filter_max_ping_servers(healthy_servers)
     for server in healthy_servers:
         source = str(server.get("source", "")).strip().lower()
-        if source not in {"vpngate", "riseup", "calyx", "fox3000foxy/ovpn-configs-scraper"}:
+        if source not in {"vpngate", "riseup", "fox3000foxy/ovpn-configs-scraper"}:
             raise ValueError(
                 f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
             )
@@ -1042,7 +1027,7 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
 
 def deduplicate_candidates(raw_candidates):
     """Keep one record per endpoint, preferring first-party approved providers."""
-    source_priority = {"vpngate": 0, "riseup": 1, "calyx": 2, "fox3000foxy/ovpn-configs-scraper": 3}
+    source_priority = {"vpngate": 0, "riseup": 1, "fox3000foxy/ovpn-configs-scraper": 2}
     unique_map = {}
     for item in raw_candidates:
         ip, port, proto, has_tls_key = extract_server_endpoint(item["ovpn_text"])
@@ -1064,7 +1049,6 @@ def main():
         ("VPNGate", fetch_vpngate),
         ("fox3000foxy/OVPN-Configs-scraper", fetch_fox3000foxy),
         ("RiseupVPN", fetch_riseup),
-        ("CalyxVPN", fetch_calyx),
     ]
     for source_name, fetcher in source_fetchers:
         try:
@@ -1100,9 +1084,9 @@ def main():
 
     healthy_servers = run_end_to_end_checks(healthy_servers)
 
-    publishable_servers = [server for server in healthy_servers if server.get("_publishable", True)]
+    publishable_servers = filter_max_ping_servers([server for server in healthy_servers if server.get("_publishable", True)])
     source_counts = Counter(str(server.get("source", "")).lower() for server in publishable_servers)
-    print("Per-source publishable servers: " + ", ".join(f"{label}={source_counts.get(slug, 0)}" for label, slug in (("VPNGate", "vpngate"), ("RiseupVPN", "riseup"), ("CalyxVPN", "calyx"), ("fox3000foxy", "fox3000foxy/ovpn-configs-scraper"))))
+    print("Per-source publishable servers: " + ", ".join(f"{label}={source_counts.get(slug, 0)}" for label, slug in (("VPNGate", "vpngate"), ("RiseupVPN", "riseup"), ("fox3000foxy/OVPN-Configs-scraper", "fox3000foxy/ovpn-configs-scraper"))))
 
     if len(publishable_servers) < MIN_SERVERS_THRESHOLD:
         print(

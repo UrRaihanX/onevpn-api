@@ -34,6 +34,9 @@ jobs:
       - name: Validate Python syntax
         run: python -m py_compile fetch_servers.py
 
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Fetch and Check VPN Servers
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
