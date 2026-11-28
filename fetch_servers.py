@@ -10,8 +10,9 @@ import threading
 import subprocess
 import tempfile
 import ipaddress
+import zipfile
 import requests
-from io import StringIO
+from io import StringIO, BytesIO
 from collections import Counter
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
@@ -25,10 +26,6 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "dist")
 DATA_BRANCH = os.environ.get("DATA_BRANCH", "data")
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "UrRaihanX/onevpn-api")
 CDN_BASE_URL = f"https://cdn.jsdelivr.net/gh/{GITHUB_REPOSITORY}@{DATA_BRANCH}"
-
-GITHUB_REPOS = [
-    "https://api.github.com/repos/Zoult/.ovpn/contents/",
-]
 
 SIMPLE_SCRAPE_SITES = [
     {"name": "OpenProxyList", "url": "https://openproxylist.com/openvpn/"},
@@ -262,6 +259,74 @@ def enrich_with_geoip(servers: list):
             time.sleep(1.5)
 
 
+def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
+    """Normalize third-party profiles for modern OpenVPN and Android openvpn_flutter."""
+    output = []
+    skip_inline_auth = False
+    seen = set()
+    removed = {"script-security", "up", "down", "block-outside-dns", "register-dns"}
+    for raw_line in ovpn_text.splitlines():
+        stripped = raw_line.strip()
+        if skip_inline_auth:
+            if stripped.lower() == "</auth-user-pass>":
+                skip_inline_auth = False
+            continue
+        if not stripped or stripped.startswith(("#", ";")):
+            output.append(raw_line)
+            continue
+        if stripped.lower() == "<auth-user-pass>":
+            skip_inline_auth = True
+            continue
+        parts = stripped.split(None, 1)
+        directive = parts[0].lower()
+        if directive == "auth-user-pass":
+            continue
+        if directive in removed:
+            continue
+        if directive in {"data-ciphers", "data-ciphers-fallback"}:
+            if directive not in seen:
+                # Use the requested compatibility set consistently across providers.
+                value = (
+                    "AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"
+                    if directive == "data-ciphers"
+                    else "AES-128-CBC"
+                )
+                output.append(f"{directive} {value}")
+                seen.add(directive)
+            continue
+        output.append(raw_line)
+        seen.add(directive)
+
+    required = [
+        ('data-ciphers', "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"),
+        ('data-ciphers-fallback', "data-ciphers-fallback AES-128-CBC"),
+        ('pull-filter-route-ipv6', 'pull-filter ignore "route-ipv6"'),
+        ('pull-filter-ifconfig-ipv6', 'pull-filter ignore "ifconfig-ipv6"'),
+        ('dhcp-option-dns-1.1.1.1', "dhcp-option DNS 1.1.1.1"),
+        ('dhcp-option-dns-8.8.8.8', "dhcp-option DNS 8.8.8.8"),
+        ('persist-key', "persist-key"),
+        ('persist-tun', "persist-tun"),
+    ]
+    existing = set()
+    for line in output:
+        value = line.strip().lower()
+        if value.startswith("pull-filter ignore") and "route-ipv6" in value:
+            existing.add('pull-filter-route-ipv6')
+        elif value.startswith("pull-filter ignore") and "ifconfig-ipv6" in value:
+            existing.add('pull-filter-ifconfig-ipv6')
+        elif value == "dhcp-option dns 1.1.1.1":
+            existing.add('dhcp-option-dns-1.1.1.1')
+        elif value == "dhcp-option dns 8.8.8.8":
+            existing.add('dhcp-option-dns-8.8.8.8')
+        elif value in {"persist-key", "persist-tun"}:
+            existing.add(value)
+    for key, line in required:
+        if key not in existing and not (key in seen):
+            output.append(line)
+    if requires_auth:
+        output.append("auth-user-pass")
+    return "\n".join(output).rstrip() + "\n"
+
 def fetch_vpngate():
     candidates = []
     try:
@@ -282,6 +347,9 @@ def fetch_vpngate():
                     "country": row[5] or "Unknown",
                     "country_code": normalize_country_code(row[6]),
                     "source": "VPNGate",
+                    "username": "vpn",
+                    "password": "vpn",
+                    "requires_auth": True,
                 })
             except Exception:
                 continue
@@ -290,43 +358,257 @@ def fetch_vpngate():
     return candidates
 
 
-def fetch_github():
-    candidates = []
-    github_headers = {
-        **HEADERS,
-        "Accept": "application/vnd.github+json",
-    }
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        github_headers["Authorization"] = f"Bearer {token}"
 
-    for api_url in GITHUB_REPOS:
-        try:
-            res = requests.get(api_url, headers=github_headers, timeout=15)
-            if res.status_code in (403, 429):
-                print(f"GitHub API rate limit hit ({res.status_code}) for {api_url}")
-                continue
-            if res.status_code != 200:
-                print(f"GitHub API returned {res.status_code} for {api_url}")
-                continue
-            for f in res.json()[:30]:
-                if f.get("name", "").endswith(".ovpn") and f.get("download_url"):
-                    try:
-                        ovpn_res = requests.get(f["download_url"], headers=HEADERS, timeout=10)
-                        if ovpn_res.status_code == 200:
-                            candidates.append({
-                                "ovpn_text": ovpn_res.text,
-                                "country": "Unknown",
-                                "country_code": "XX",
-                                "source": "GitHub",
-                            })
-                    except Exception:
+
+def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
+    """Normalize third-party profiles for modern OpenVPN and Android openvpn_flutter."""
+    output = []
+    skip_inline_auth = False
+    seen = set()
+    removed = {"script-security", "up", "down", "block-outside-dns", "register-dns"}
+    for raw_line in ovpn_text.splitlines():
+        stripped = raw_line.strip()
+        if skip_inline_auth:
+            if stripped.lower() == "</auth-user-pass>":
+                skip_inline_auth = False
+            continue
+        if not stripped or stripped.startswith(("#", ";")):
+            output.append(raw_line)
+            continue
+        if stripped.lower() == "<auth-user-pass>":
+            skip_inline_auth = True
+            continue
+        parts = stripped.split(None, 1)
+        directive = parts[0].lower()
+        if directive == "auth-user-pass":
+            continue
+        if directive in removed:
+            continue
+        if directive in {"data-ciphers", "data-ciphers-fallback"}:
+            if directive not in seen:
+                # Use the requested compatibility set consistently across providers.
+                value = (
+                    "AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"
+                    if directive == "data-ciphers"
+                    else "AES-128-CBC"
+                )
+                output.append(f"{directive} {value}")
+                seen.add(directive)
+            continue
+        output.append(raw_line)
+        seen.add(directive)
+
+    required = [
+        ('data-ciphers', "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"),
+        ('data-ciphers-fallback', "data-ciphers-fallback AES-128-CBC"),
+        ('pull-filter-route-ipv6', 'pull-filter ignore "route-ipv6"'),
+        ('pull-filter-ifconfig-ipv6', 'pull-filter ignore "ifconfig-ipv6"'),
+        ('dhcp-option-dns-1.1.1.1', "dhcp-option DNS 1.1.1.1"),
+        ('dhcp-option-dns-8.8.8.8', "dhcp-option DNS 8.8.8.8"),
+        ('persist-key', "persist-key"),
+        ('persist-tun', "persist-tun"),
+    ]
+    existing = set()
+    for line in output:
+        value = line.strip().lower()
+        if value.startswith("pull-filter ignore") and "route-ipv6" in value:
+            existing.add('pull-filter-route-ipv6')
+        elif value.startswith("pull-filter ignore") and "ifconfig-ipv6" in value:
+            existing.add('pull-filter-ifconfig-ipv6')
+        elif value == "dhcp-option dns 1.1.1.1":
+            existing.add('dhcp-option-dns-1.1.1.1')
+        elif value == "dhcp-option dns 8.8.8.8":
+            existing.add('dhcp-option-dns-8.8.8.8')
+        elif value in {"persist-key", "persist-tun"}:
+            existing.add(value)
+    for key, line in required:
+        if key not in existing and not (key in seen):
+            output.append(line)
+    if requires_auth:
+        output.append("auth-user-pass")
+    return "\n".join(output).rstrip() + "\n"
+
+
+def fetch_riseup():
+    """Fetch Riseup's official LEAP API and create self-contained OpenVPN profiles."""
+    candidates = []
+    ca_url = "https://raw.githubusercontent.com/leapcode/bitmask-vpn/main/providers/riseup/riseup-ca.crt"
+    api = "https://api.black.riseup.net/3"
+    try:
+        with tempfile.TemporaryDirectory(prefix="onevpn-riseup-") as temp_dir:
+            ca_path = os.path.join(temp_dir, "riseup-ca.crt")
+            ca_response = requests.get(ca_url, headers=HEADERS, timeout=25)
+            ca_response.raise_for_status()
+            ca_pem = ca_response.text.strip()
+            if "BEGIN CERTIFICATE" not in ca_pem:
+                raise ValueError("Riseup CA endpoint did not return a PEM certificate")
+            with open(ca_path, "w", encoding="utf-8") as handle:
+                handle.write(ca_pem + "\n")
+
+            gateways_response = requests.get(
+                f"{api}/config/eip-service.json", headers=HEADERS,
+                verify=ca_path, timeout=30,
+            )
+            gateways_response.raise_for_status()
+            service = gateways_response.json()
+            gateways = service.get("gateways", [])
+            if not isinstance(gateways, list) or not gateways:
+                raise ValueError("Riseup API returned no gateways")
+
+            cert_response = requests.get(
+                f"{api}/cert", headers=HEADERS, verify=ca_path, timeout=30,
+            )
+            cert_response.raise_for_status()
+            credential_bundle = cert_response.text
+            cert_match = re.search(
+                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                credential_bundle, re.S,
+            )
+            key_match = re.search(
+                r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z ]* )?PRIVATE KEY-----",
+                credential_bundle, re.S,
+            )
+            if not cert_match or not key_match:
+                raise ValueError("Riseup /3/cert response lacks a PEM client certificate or private key")
+            client_cert = cert_match.group(0).strip()
+            client_key = key_match.group(0).strip()
+            locations = service.get("locations", {}) or {}
+            openvpn_options = service.get("openvpn_configuration", {}) or {}
+
+            for gateway in gateways:
+                caps = gateway.get("capabilities", {}) or {}
+                host = gateway.get("ip_address") or gateway.get("host")
+                if not host:
+                    continue
+                transport_entries = caps.get("transport") or []
+                endpoints = []
+                for transport in transport_entries:
+                    if str(transport.get("type", "")).lower() != "openvpn":
                         continue
-        except Exception as e:
-            print(f"GitHub Error: {e}")
+                    for proto in transport.get("protocols", ["udp"]):
+                        for port in transport.get("ports", []):
+                            endpoints.append((str(proto).lower(), int(port)))
+                # Compatibility with older EIP-service v3 gateway payloads.
+                if not endpoints and "ports" in caps:
+                    for proto in caps.get("protocols", ["udp"]):
+                        for port in caps.get("ports", []):
+                            endpoints.append((str(proto).lower(), int(port)))
+                location = gateway.get("location") or "Unknown"
+                location_info = locations.get(location, {}) if isinstance(locations, dict) else {}
+                country = location_info.get("name") or location
+                country_code = normalize_country_code(location_info.get("country_code"))
+                for proto, port in endpoints:
+                    if proto not in {"tcp", "udp"} or not (1 <= port <= 65535):
+                        continue
+                    lines = [
+                        "client", "dev tun", f"proto {proto}-client" if proto == "tcp" else "proto udp",
+                        f"remote {host} {port}", "resolv-retry infinite", "nobind",
+                        "persist-key", "persist-tun", "remote-cert-tls server",
+                    ]
+                    for option, value in openvpn_options.items():
+                        name = str(option).strip().lower()
+                        if name in {"dev", "proto", "remote", "auth-user-pass", "script-security", "up", "down"}:
+                            continue
+                        if isinstance(value, bool):
+                            if value:
+                                lines.append(name)
+                        elif value is not None and str(value).strip():
+                            lines.append(f"{name} {value}")
+                    lines.extend([
+                        "<ca>", ca_pem, "</ca>",
+                        "<cert>", client_cert, "</cert>",
+                        "<key>", client_key, "</key>",
+                    ])
+                    candidates.append({
+                        "ovpn_text": "\n".join(lines) + "\n",
+                        "country": country,
+                        "country_code": country_code,
+                        "source": "riseup",
+                        "username": "",
+                        "password": "",
+                        "requires_auth": False,
+                    })
+            print(f"RiseupVPN: collected {len(candidates)} OpenVPN gateway profiles")
+    except Exception as exc:
+        print(f"RiseupVPN Error: {exc}")
     return candidates
 
 
+def fetch_vpnbook():
+    """Download VPNBook OpenVPN ZIP profiles only when a live page password is parsed."""
+    candidates = []
+    page_url = "https://www.vpnbook.com/freevpn"
+    try:
+        response = requests.get(page_url, headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        html = response.text
+        soup = BeautifulSoup(html, "html.parser")
+        visible_text = soup.get_text(" ", strip=True)
+        combined = visible_text + "\n" + html
+        password = None
+        patterns = [
+            r"(?i)password\s*[:：]\s*(?:</?[^>]+>\s*)*([A-Za-z0-9!@#$%^&*()_+=.-]{5,})",
+            r"(?i)Password.{0,180}?<[^>]*>\s*([A-Za-z0-9!@#$%^&*()_+=.-]{5,})\s*</",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, combined)
+            if match:
+                candidate_password = match.group(1).strip()
+                if candidate_password.lower() not in {"updated", "changed", "password"}:
+                    password = candidate_password
+                    break
+        if not password:
+            text_match = re.search(r"(?i)password\s*[:：]\s*([A-Za-z0-9!@#$%^&*()_+=.-]{5,})", visible_text)
+            if text_match:
+                password = text_match.group(1).strip()
+        if not password:
+            print("VPNBook Warning: live password could not be reliably extracted; skipping this source.")
+            return candidates
+
+        archive_urls = set()
+        for anchor in soup.find_all("a", href=True):
+            href = urljoin(response.url, anchor["href"].strip())
+            if re.search(r"vpnbook-openvpn-[^/?#]+\.zip(?:[?#]|$)", href, re.I):
+                archive_urls.add(href.split("?", 1)[0])
+        # Include links embedded in scripts/RSC payloads.
+        for match in re.findall(r"""(?:https?:)?//[^"'\\\s<>]+vpnbook-openvpn-[^"'\\\s<>]+\.zip|/[^"'\\\s<>]*vpnbook-openvpn-[^"'\\\s<>]+\.zip""", html, re.I):
+            archive_urls.add(urljoin(response.url, match))
+        if not archive_urls:
+            print("VPNBook Warning: no vpnbook-openvpn-*.zip links found; skipping this source.")
+            return candidates
+
+        for archive_url in sorted(archive_urls):
+            try:
+                archive_response = requests.get(archive_url, headers=HEADERS, timeout=45)
+                archive_response.raise_for_status()
+                with zipfile.ZipFile(BytesIO(archive_response.content)) as archive:
+                    for member in archive.namelist():
+                        if not member.lower().endswith(".ovpn") or member.startswith("__MACOSX/"):
+                            continue
+                        try:
+                            profile = archive.read(member).decode("utf-8-sig", errors="replace")
+                            if "remote " not in profile.lower() or not re.search(r"(?im)^\s*dev\s+(?:tun|tap)", profile):
+                                continue
+                            candidates.append({
+                                "ovpn_text": profile,
+                                "country": "Unknown",
+                                "country_code": "XX",
+                                "source": "vpnbook",
+                                "username": "vpnbook",
+                                "password": password,
+                                "requires_auth": True,
+                            })
+                        except Exception as exc:
+                            print(f"VPNBook profile parse error ({member}): {exc}")
+            except Exception as exc:
+                print(f"VPNBook archive error ({archive_url}): {exc}")
+        print(f"VPNBook: collected {len(candidates)} OpenVPN profiles")
+    except Exception as exc:
+        print(f"VPNBook Error: {exc}")
+    return candidates
+
+
+def fetch_simple_sites():
 
 def fetch_simple_sites():
     """Fetch direct .ovpn links from static source pages with bounded retries."""
@@ -814,6 +1096,8 @@ def process_server(item):
         "isp": "Unknown",
         "ping_ms": ping_ms,
         "source": item["source"],
+        "username": item.get("username", ""),
+        "password": item.get("password", ""),
         "config_path": config_path,
         "config_url": f"{CDN_BASE_URL}/{config_path}",
         "_ovpn_text": item["ovpn_text"],
@@ -867,10 +1151,29 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
 
 def main():
     raw_candidates = []
-    raw_candidates.extend(fetch_vpngate())
-    raw_candidates.extend(fetch_github())
-    raw_candidates.extend(fetch_simple_sites())
-    raw_candidates.extend(fetch_with_playwright())
+    source_fetchers = [
+        ("VPNGate", fetch_vpngate),
+        ("RiseupVPN", fetch_riseup),
+        ("VPNBook", fetch_vpnbook),
+        ("OpenProxyList", fetch_simple_sites),
+        ("IPSpeed", fetch_with_playwright),
+    ]
+    for source_name, fetcher in source_fetchers:
+        try:
+            fetched = fetcher()
+            for candidate in fetched:
+                candidate["requires_auth"] = bool(candidate.get("requires_auth", re.search(
+                    r"(?im)^\\s*auth-user-pass(?:\\s|$)", candidate.get("ovpn_text", "")
+                )))
+                candidate.setdefault("username", "")
+                candidate.setdefault("password", "")
+                candidate["ovpn_text"] = patch_ovpn_config(
+                    candidate["ovpn_text"], candidate["requires_auth"]
+                )
+            raw_candidates.extend(fetched)
+            print(f"{source_name}: source completed with {len(fetched)} profiles")
+        except Exception as exc:
+            print(f"{source_name} source failed independently: {exc}")
 
     raw_counts = Counter(item["source"] for item in raw_candidates)
     print(f"Fetched raw candidates by source: {dict(raw_counts)}")
