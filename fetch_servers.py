@@ -1015,6 +1015,8 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     full_servers = []
 
     for server in healthy_servers:
+        if not server.get("_publishable", True):
+            raise ValueError("Refusing to publish a profile marked private/non-publishable")
         ovpn_text = server.pop("_ovpn_text")
         server.pop("_publishable", None)
         ovpn_file = os.path.join(output_dir, server["config_path"])
@@ -1123,9 +1125,9 @@ def main():
     meta_kb = os.path.getsize(os.path.join(OUTPUT_DIR, "servers_meta.json")) / 1024
     full_kb = os.path.getsize(os.path.join(OUTPUT_DIR, "servers.json")) / 1024
     print(
-        f"Done! Saved {len(healthy_servers)} servers -> "
+        f"Done! Saved {len(publishable_servers)} publishable servers -> "
         f"servers_meta.json ({meta_kb:.1f} KB), servers.json ({full_kb:.1f} KB), "
-        f"and {len(healthy_servers)} individual .ovpn files in {OUTPUT_DIR}/configs/."
+        f"and {len(publishable_servers)} individual .ovpn files in {OUTPUT_DIR}/configs/."
     )
 
 
