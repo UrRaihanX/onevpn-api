@@ -392,7 +392,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
         api_root = f"{api_uri}/{api_version}"
         gateways_response = requests.get(
             f"{api_root}/config/eip-service.json",
-            headers=HEADERS, timeout=(8, 30), verify=ca_path,
+            headers=HEADERS, timeout=(8, 30), verify=True,
         )
         gateways_response.raise_for_status()
         service = gateways_response.json()
@@ -582,8 +582,8 @@ def fetch_github_ovpn_repository(repository: str, source_name: str):
                 response = requests.get(raw_url, headers=github_headers, timeout=(8, 20))
                 response.raise_for_status()
                 profile = response.text
-                if re.search(r"(?im)^\\s*remote\\s+\\S+\\s+\\d+", profile) and re.search(r"(?im)^\\s*dev\\s+\\S+", profile):
-                    return {"ovpn_text": profile, "country": "Unknown", "country_code": "XX", "source": source_name, "username": "", "password": "", "requires_auth": bool(re.search(r"(?im)^\\s*auth-user-pass(?:\\s|$)", profile)), "publishable": True}
+                if re.search(r"(?im)^\s*remote\s+\S+\s+\d+", profile) and re.search(r"(?im)^\s*dev\s+\S+", profile):
+                    return {"ovpn_text": profile, "country": "Unknown", "country_code": "XX", "source": source_name, "username": "", "password": "", "requires_auth": bool(re.search(r"(?im)^\s*auth-user-pass(?:\s|$)", profile)), "publishable": True}
             except Exception as exc:
                 print(f"{source_name}: skipped {path}: {exc}")
             return None
@@ -861,7 +861,7 @@ def run_end_to_end_checks(healthy_servers: list):
 
     passed = 0
     checked = 0
-    failed_groups = set()
+    failed_server_ids = set()
 
     # Exercise each provider independently so one provider's success cannot mask
     # broken credentials, endpoint metadata, or profile generation from another.
@@ -880,20 +880,21 @@ def run_end_to_end_checks(healthy_servers: list):
             ok, detail = run_openvpn_end_to_end(server)
             print(f"{source.upper()} E2E {'PASS' if ok else 'ATTEMPT FAILED'}: "
                   f"{proto.upper()} {server['ip']}:{server['port']} - {detail}")
+            if not ok:
+                failed_server_ids.add(server.get("id"))
             if ok:
                 passed += 1
                 protocol_passed = True
                 break
         if not protocol_passed:
-            failed_groups.add((source, proto))
             print(f"{source.upper()} E2E FAIL: no working {proto.upper()} tunnel "
                   f"found in {min(len(candidates), 2)} attempted endpoint(s).")
 
     print(f"VPN E2E summary: {passed}/{checked} provider/protocol checks passed.")
-    if failed_groups:
+    if failed_server_ids:
         before = len(healthy_servers)
-        healthy_servers = [server for server in healthy_servers if (str(server.get("source", "")).lower(), server.get("protocol")) not in failed_groups]
-        print(f"Excluded {before - len(healthy_servers)} servers from failed E2E source/protocol groups.")
+        healthy_servers = [server for server in healthy_servers if server.get("id") not in failed_server_ids]
+        print(f"Excluded {before - len(healthy_servers)} individual profiles that failed E2E checks.")
     return healthy_servers
 
 def process_server(item):
