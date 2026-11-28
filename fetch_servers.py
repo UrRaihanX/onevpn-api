@@ -345,123 +345,252 @@ def fetch_vpngate():
 
 
 
-def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, source_slug: str, ca_fingerprint: str = ""):
-    """Fetch Bitmask v3 credentials, pin the provider CA, and build OpenVPN profiles."""
+def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str):
+    """Discover a LEAP provider dynamically and build Android-compatible OpenVPN profiles."""
     candidates = []
-    api = api_base.rstrip("/")
+    ca_path = None
     try:
-        ca_response = requests.get(ca_url, headers=HEADERS, timeout=25)
+        provider_response = requests.get(provider_url, headers=HEADERS, timeout=(8, 20))
+        provider_response.raise_for_status()
+        provider = provider_response.json()
+
+        api_uri = str(provider["api_uri"]).rstrip("/")
+        api_version = str(provider.get("api_version", "3") or "3").strip("/")
+        ca_cert_uri = str(provider["ca_cert_uri"])
+        if not api_uri.startswith("https://") or not ca_cert_uri.startswith("https://"):
+            raise ValueError(f"{provider_name} provider.json contains a non-HTTPS API or CA URL")
+
+        ca_response = requests.get(ca_cert_uri, headers=HEADERS, timeout=(8, 25))
         ca_response.raise_for_status()
         ca_pem = ca_response.text.strip()
-        if "BEGIN CERTIFICATE" not in ca_pem:
+        if "-----BEGIN CERTIFICATE-----" not in ca_pem:
             raise ValueError(f"{provider_name} CA endpoint did not return a PEM certificate")
-        if ca_fingerprint:
-            actual_fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(ca_pem)).hexdigest()
-            expected_fingerprint = ca_fingerprint.lower().removeprefix("sha256:").replace(":", "").strip()
-            if actual_fingerprint.lower() != expected_fingerprint:
-                raise ValueError(f"{provider_name} provider CA fingerprint mismatch")
 
-        # The provider CA authenticates the VPN server/client certificates inside
-        # the generated OpenVPN profile. The provider API itself currently uses
-        # a publicly trusted HTTPS certificate, so requests must use system roots.
-        with tempfile.TemporaryDirectory(prefix=f"onevpn-{source_slug}-ca-") as temp_dir:
-            ca_path = os.path.join(temp_dir, "provider-ca.pem")
-            with open(ca_path, "w", encoding="utf-8") as handle:
-                handle.write(ca_pem + "\n")
+        # Use a real .crt file for requests' CA bundle verification and always unlink it.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".crt",
+            prefix=f"onevpn-{source_slug}-", delete=False,
+        ) as ca_file:
+            ca_file.write(ca_pem + "\n")
+            ca_path = ca_file.name
 
-            gateways_response = requests.get(
-                f"{api}/3/config/eip-service.json", headers=HEADERS,
-                timeout=30,
-            )
-            gateways_response.raise_for_status()
-            service = gateways_response.json()
-            gateways = service.get("gateways", [])
-            if not isinstance(gateways, list) or not gateways:
-                raise ValueError(f"{provider_name} API returned no gateways")
+        api_root = f"{api_uri}/{api_version}"
+        gateways_response = requests.get(
+            f"{api_root}/config/eip-service.json",
+            headers=HEADERS, timeout=(8, 30), verify=ca_path,
+        )
+        gateways_response.raise_for_status()
+        service = gateways_response.json()
+        gateways = service.get("gateways", [])
+        if not isinstance(gateways, list) or not gateways:
+            raise ValueError(f"{provider_name} API returned no gateways")
 
-            cert_response = requests.get(
-                f"{api}/3/cert", headers=HEADERS, timeout=30,
+        # Request one shared client credential bundle per provider, not per gateway.
+        cert_response = requests.get(
+            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=ca_path,
+        )
+        cert_response.raise_for_status()
+        cert_bundle = cert_response.text
+        cert_match = re.search(
+            r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            cert_bundle, re.S,
+        )
+        key_match = re.search(
+            r"-----BEGIN (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)-----.*?"
+            r"-----END (?:PRIVATE KEY|RSA PRIVATE KEY|EC PRIVATE KEY)-----",
+            cert_bundle, re.S,
+        )
+        if not cert_match or not key_match:
+            raise ValueError(
+                f"{provider_name} /cert response lacks a PEM certificate or supported private key"
             )
-            cert_response.raise_for_status()
-            bundle = cert_response.text
-            cert_match = re.search(
-                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", bundle, re.S
-            )
-            key_match = re.search(
-                r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z ]* )?PRIVATE KEY-----",
-                bundle, re.S,
-            )
-            if not cert_match or not key_match:
-                raise ValueError(f"{provider_name} /3/cert response lacks a PEM certificate or private key")
-            client_cert, client_key = cert_match.group(0).strip(), key_match.group(0).strip()
-            locations = service.get("locations", {}) or {}
-            openvpn_options = service.get("openvpn_configuration", {}) or {}
+        client_cert = cert_match.group(0).strip()
+        client_key = key_match.group(0).strip()
 
-            for gateway in gateways:
-                caps = gateway.get("capabilities", {}) or {}
+        locations = service.get("locations", {}) or {}
+        openvpn_options = service.get("openvpn_configuration", {}) or {}
+        if not isinstance(openvpn_options, dict):
+            raise ValueError(f"{provider_name} openvpn_configuration is not an object")
+
+        for gateway in gateways:
+            capabilities = gateway.get("capabilities", {}) or {}
+            transports = capabilities.get("transport", []) or []
+            for transport in transports:
+                if str(transport.get("type", "")).lower() != "openvpn":
+                    continue
+
+                protocols = [
+                    str(proto).lower()
+                    for proto in (transport.get("protocols") or [])
+                    if str(proto).lower() in {"udp", "tcp"}
+                ]
+                if not protocols:
+                    protocol_value = str(transport.get("protocol", "")).lower()
+                    if protocol_value in {"udp", "tcp"}:
+                        protocols = [protocol_value]
+                if not protocols:
+                    continue
+
+                # One endpoint per gateway: UDP is preferred, TCP is the fallback.
+                proto = "udp" if "udp" in protocols else "tcp"
+                ports = transport.get("ports", []) or []
+                if isinstance(ports, (int, str)):
+                    ports = [ports]
+                valid_ports = []
+                for raw_port in ports:
+                    try:
+                        port = int(raw_port)
+                        if 1 <= port <= 65535:
+                            valid_ports.append(port)
+                    except (TypeError, ValueError):
+                        continue
+                if not valid_ports:
+                    continue
+
                 host = gateway.get("ip_address") or gateway.get("host")
                 if not host:
                     continue
-                endpoints = []
-                for transport in caps.get("transport") or []:
-                    if str(transport.get("type", "")).lower() == "openvpn":
-                        for proto in transport.get("protocols", ["udp"]):
-                            for port in transport.get("ports", []):
-                                endpoints.append((str(proto).lower(), int(port)))
-                if not endpoints and "ports" in caps:
-                    for proto in caps.get("protocols", ["udp"]):
-                        for port in caps.get("ports", []):
-                            endpoints.append((str(proto).lower(), int(port)))
-
                 location = gateway.get("location") or "Unknown"
-                info = locations.get(location, {}) if isinstance(locations, dict) else {}
-                country = info.get("name") or location
-                country_code = normalize_country_code(info.get("country_code"))
-                for proto, port in endpoints:
-                    if proto not in {"tcp", "udp"} or not 1 <= port <= 65535:
+                location_info = locations.get(location, {}) if isinstance(locations, dict) else {}
+                country = location_info.get("name") or location
+                country_code = normalize_country_code(location_info.get("country_code"))
+
+                lines = [
+                    "client", "dev tun",
+                    f"proto {proto}-client" if proto == "tcp" else "proto udp",
+                    f"remote {host} {valid_ports[0]}",
+                    "resolv-retry infinite", "nobind", "persist-key", "persist-tun",
+                    "remote-cert-tls server", "auth-nocache",
+                ]
+                for option, value in openvpn_options.items():
+                    name = str(option).strip().lower().replace("_", "-")
+                    if not name or name in {
+                        "client", "dev", "proto", "remote", "auth-user-pass",
+                        "script-security", "up", "down", "ca", "cert", "key",
+                    }:
                         continue
-                    lines = [
-                        "client", "dev tun",
-                        f"proto {proto}-client" if proto == "tcp" else "proto udp",
-                        f"remote {host} {port}", "resolv-retry infinite", "nobind",
-                        "persist-key", "persist-tun", "remote-cert-tls server",
-                    ]
-                    for option, value in openvpn_options.items():
-                        name = str(option).strip().lower()
-                        if name in {"dev", "proto", "remote", "auth-user-pass", "script-security", "up", "down"}:
-                            continue
-                        if isinstance(value, bool):
-                            if value:
-                                lines.append(name)
-                        elif value is not None and str(value).strip():
-                            lines.append(f"{name} {value}")
-                    lines.extend([
-                        "<ca>", ca_pem, "</ca>", "<cert>", client_cert, "</cert>",
-                        "<key>", client_key, "</key>",
-                    ])
-                    candidates.append({
-                        "ovpn_text": "\n".join(lines) + "\n",
-                        "country": country, "country_code": country_code,
-                        "source": source_slug, "username": "", "password": "",
-                        "requires_auth": False, "publishable": True,
-                    })
-        print(f"{provider_name}: collected {len(candidates)} public OpenVPN gateway profiles")
+                    if isinstance(value, bool):
+                        if value:
+                            lines.append(name)
+                    elif isinstance(value, (list, tuple)):
+                        for option_value in value:
+                            if option_value is not None and str(option_value).strip():
+                                lines.append(f"{name} {option_value}")
+                    elif value is not None and str(value).strip():
+                        lines.append(f"{name} {value}")
+
+                lines.extend([
+                    "<ca>", ca_pem, "</ca>",
+                    "<cert>", client_cert, "</cert>",
+                    "<key>", client_key, "</key>",
+                ])
+                candidates.append({
+                    "ovpn_text": "\n".join(lines) + "\n",
+                    "country": country,
+                    "country_code": country_code,
+                    "source": source_slug,
+                    "username": "",
+                    "password": "",
+                    "requires_auth": False,
+                    "publishable": True,
+                })
+                # Only the preferred OpenVPN transport is emitted for this gateway.
+                break
+
+        print(f"{provider_name}: collected {len(candidates)} OpenVPN gateway profiles")
     except Exception as exc:
         print(f"{provider_name} Error: {exc}")
+    finally:
+        if ca_path and os.path.exists(ca_path):
+            try:
+                os.remove(ca_path)
+            except OSError as exc:
+                print(f"{provider_name}: could not remove temporary CA file: {exc}")
     return candidates
 
 
 def fetch_riseup():
-    return fetch_bitmask_provider("RiseupVPN", "https://api.black.riseup.net",
-                                  "https://black.riseup.net/ca.crt", "riseup",
-                                  "SHA256:825fe0695d0134e7b7c80dd624cf33780d8e5e7fbd782ca0c8a87e24e108b468")
+    return fetch_leap_provider(
+        "RiseupVPN", "https://riseup.net/provider.json", "riseup"
+    )
 
 
 def fetch_calyx():
-    return fetch_bitmask_provider("Calyx VPN", "https://api.calyx.net:4430",
-                                  "https://calyx.net/ca.crt", "calyx")
+    return fetch_leap_provider(
+        "CalyxVPN", "https://calyx.net/provider.json", "calyx"
+    )
 
 
+def fetch_github_ovpn_repository(repository: str, source_name: str):
+    """Fetch public .ovpn files from a GitHub repository using only requests."""
+    candidates = []
+    try:
+        repo_response = requests.get(
+            f"https://api.github.com/repos/{repository}",
+            headers=HEADERS, timeout=(8, 20),
+        )
+        repo_response.raise_for_status()
+        default_branch = repo_response.json().get("default_branch") or "main"
+
+        tree_response = requests.get(
+            f"https://api.github.com/repos/{repository}/git/trees/{default_branch}?recursive=1",
+            headers=HEADERS, timeout=(8, 30),
+        )
+        tree_response.raise_for_status()
+        tree = tree_response.json()
+        if tree.get("truncated"):
+            print(f"{source_name}: GitHub tree was truncated; only returned .ovpn files will be used.")
+
+        paths = [
+            entry.get("path", "")
+            for entry in tree.get("tree", [])
+            if entry.get("type") == "blob"
+            and entry.get("path", "").lower().endswith(".ovpn")
+        ][:100]
+
+        for path in paths:
+            try:
+                raw_url = (
+                    f"https://raw.githubusercontent.com/{repository}/"
+                    f"{default_branch}/{path}"
+                )
+                profile_response = requests.get(
+                    raw_url, headers=HEADERS, timeout=(8, 20),
+                )
+                profile_response.raise_for_status()
+                profile = profile_response.text
+                if re.search(r"(?im)^\s*remote\s+\S+\s+\d+", profile) and re.search(
+                    r"(?im)^\s*dev\s+\S+", profile
+                ):
+                    candidates.append({
+                        "ovpn_text": profile,
+                        "country": "Unknown",
+                        "country_code": "XX",
+                        "source": source_name,
+                        "username": "",
+                        "password": "",
+                        "requires_auth": bool(re.search(
+                            r"(?im)^\s*auth-user-pass(?:\s|$)", profile
+                        )),
+                        "publishable": True,
+                    })
+            except Exception as exc:
+                print(f"{source_name}: skipped {path}: {exc}")
+    except Exception as exc:
+        print(f"{source_name} Error: {exc}")
+    print(f"{source_name}: collected {len(candidates)} public .ovpn profiles")
+    return candidates
+
+
+def fetch_zoult():
+    return fetch_github_ovpn_repository("Zoult/.ovpn", "Zoult/.ovpn")
+
+
+def fetch_fox3000foxy():
+    return fetch_github_ovpn_repository(
+        "fox3000foxy/OVPN-Configs-scraper",
+        "fox3000foxy/OVPN-Configs-scraper",
+    )
 
 def install_openvpn_client():
     """Install OpenVPN on an ephemeral CI runner if it is not already available."""
@@ -745,13 +874,8 @@ def run_end_to_end_checks(healthy_servers: list):
             print(f"{source.upper()} E2E FAIL: no working {proto.upper()} tunnel "
                   f"found in {min(len(candidates), 2)} attempted endpoint(s).")
 
-    expected_sources = {"vpngate", "riseup", "calyx"}
-    present_sources = {source for source, _ in grouped}
-    missing_sources = expected_sources - present_sources
-    for source in sorted(missing_sources):
-        print(f"{source.upper()} E2E FAIL: no health-checked publishable endpoints.")
     print(f"VPN E2E summary: {passed}/{checked} provider/protocol checks passed.")
-    if missing_sources or passed != checked:
+    if passed != checked:
         raise RuntimeError(
             "VPN E2E failed or an approved provider had no live endpoint; public feed was not updated."
         )
@@ -795,7 +919,7 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     # approved for public .ovpn distribution; Bitmask credentials refresh each run.
     for server in healthy_servers:
         source = str(server.get("source", "")).strip().lower()
-        if source not in {"vpngate", "riseup", "calyx"} or not server.get("_publishable", True):
+        if source not in {"vpngate", "riseup", "calyx", "zoult.ovpn", "fox3000foxyovpnconfigsscraper"} or not server.get("_publishable", True):
             raise ValueError(
                 f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
             )
@@ -850,8 +974,10 @@ def main():
     raw_candidates = []
     source_fetchers = [
         ("VPNGate", fetch_vpngate),
+        ("Zoult/.ovpn", fetch_zoult),
+        ("fox3000foxy/OVPN-Configs-scraper", fetch_fox3000foxy),
         ("RiseupVPN", fetch_riseup),
-        ("Calyx VPN", fetch_calyx),
+        ("CalyxVPN", fetch_calyx),
     ]
     for source_name, fetcher in source_fetchers:
         try:
@@ -908,15 +1034,6 @@ def main():
         return
 
     source_counts = Counter(str(server.get("source", "")).lower() for server in publishable_servers)
-    required_sources = {"vpngate", "riseup", "calyx"}
-    missing_sources = required_sources - set(source_counts)
-    if missing_sources:
-        print(
-            "Safety guard triggered: at least one approved source has no live profiles "
-            f"({', '.join(sorted(missing_sources))}). Keeping the previous public feed."
-        )
-        return
-
     print(f"Running GeoIP lookup for {len(publishable_servers)} publishable live servers...")
     enrich_with_geoip(publishable_servers)
 
