@@ -694,15 +694,37 @@ def run_openvpn_end_to_end(item: dict):
                 return False, "tunnel came up but an isolated egress route could not be added"
             route_added = True
 
+            # Pin curl to the exact address routed above. Without --resolve,
+            # curl performs a second DNS lookup which may return a different
+            # address (for example, behind a CDN) that has no tunnel route.
+            route_check = subprocess.run(
+                ["ip", "-4", "route", "get", route_ip],
+                capture_output=True, text=True, timeout=5,
+            )
+            if route_check.returncode != 0 or not re.search(
+                rf"\bdev\s+{re.escape(tun_device)}\b", route_check.stdout
+            ):
+                route_detail = route_check.stdout.strip() or route_check.stderr.strip()
+                return False, (
+                    "isolated egress route does not resolve through the TUN interface"
+                    + (f" ({route_detail[:180]})" if route_detail else "")
+                )
+
             egress = subprocess.run(
                 [
-                    "curl", "-4", "--interface", tun_device, "--fail", "--silent",
-                    "--show-error", "--max-time", "12", "https://api.ipify.org",
+                    "curl", "-4", "--resolve", f"api.ipify.org:443:{route_ip}",
+                    "--noproxy", "*", "--fail", "--silent", "--show-error",
+                    "--connect-timeout", "8", "--max-time", "12",
+                    "https://api.ipify.org",
                 ],
                 capture_output=True, text=True, timeout=15,
             )
             if egress.returncode != 0:
-                return False, "tunnel initialized but HTTPS traffic did not pass through it"
+                error_detail = (egress.stderr or egress.stdout).strip()
+                return False, (
+                    "tunnel route verified but pinned HTTPS egress failed"
+                    + (f" (curl exit {egress.returncode}: {error_detail[:180]})" if error_detail else "")
+                )
             try:
                 exit_ip = ipaddress.ip_address(egress.stdout.strip())
             except ValueError:
