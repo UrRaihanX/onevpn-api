@@ -53,7 +53,7 @@ KEY
                 "id": server_id, "ip": "198.51.100.10", "port": 1194,
                 "protocol": "udp", "country": "Test", "country_code": "US",
                 "flag_emoji": "🇺🇸", "flag_url": "", "isp": "Test",
-                "ping_ms": 10, "source": source, "_publishable": True,
+                "ping_ms": 10, "source": source, "_publishable": False,
                 "username": "", "password": "", "config_path": f"configs/{server_id}.ovpn",
                 "config_url": f"{fetch_servers.CDN_BASE_URL}/configs/{server_id}.ovpn",
                 "_ovpn_text": "client\ndev tun\nproto udp\nremote 198.51.100.10 1194\n",

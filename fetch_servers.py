@@ -403,7 +403,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
         api_root = f"{api_uri}/{api_version}"
         gateways_response = requests.get(
             f"{api_root}/config/eip-service.json",
-            headers=HEADERS, timeout=(8, 30), verify=True,
+            headers=HEADERS, timeout=(8, 30), verify=ca_path,
         )
         gateways_response.raise_for_status()
         service = gateways_response.json()
@@ -413,7 +413,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
 
         # Request one shared client credential bundle per provider, not per gateway.
         cert_response = requests.get(
-            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=True,
+            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=ca_path,
         )
         cert_response.raise_for_status()
         cert_bundle = cert_response.text
@@ -773,10 +773,14 @@ def run_openvpn_end_to_end(item: dict):
                     if "Initialization Sequence Completed" in log_text:
                         connected = True
                         break
-                    if any(marker in log_text for marker in (
+                    failure_markers = (
                         "AUTH_FAILED", "Exiting due to fatal error", "Options error",
-                    )):
-                        return False, "OpenVPN rejected the profile or authentication"
+                        "VERIFY ERROR", "TLS Error", "Connection refused",
+                    )
+                    if any(marker in log_text for marker in failure_markers):
+                        diagnostic = next((line.strip() for line in reversed(log_text.splitlines())
+                                           if any(marker in line for marker in failure_markers)), "")
+                        return False, "OpenVPN failed: " + (diagnostic[:220] or "unknown handshake/authentication error")
                 if process.poll() is not None:
                     break
                 time.sleep(0.5)
@@ -899,6 +903,7 @@ def run_end_to_end_checks(healthy_servers: list):
             grouped.setdefault(key, []).append(server)
 
     for (source, proto), candidates in sorted(grouped.items()):
+        candidates = sorted(candidates, key=lambda server: server.get("ping_ms", float("inf")))
         checked += 1
         protocol_passed = False
         for server in candidates[:2]:
@@ -964,7 +969,7 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     # approved for public .ovpn distribution; Bitmask credentials refresh each run.
     for server in healthy_servers:
         source = str(server.get("source", "")).strip().lower()
-        if source not in {"vpngate", "riseup", "calyx", "fox3000foxy/ovpn-configs-scraper"} or not server.get("_publishable", True):
+        if source not in {"vpngate", "riseup", "calyx", "fox3000foxy/ovpn-configs-scraper"}:
             raise ValueError(
                 f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
             )
