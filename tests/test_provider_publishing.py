@@ -82,14 +82,14 @@ KEY
                 return b"\x20"
             def close(self): pass
         fake = FakeSocket()
-        ticks = iter([0.0, 1.5, 1.525])
+        ticks = iter([0.0, 1.5, 1.53])
         with mock.patch.object(fetch_servers.socket, "socket", return_value=fake), \
              mock.patch.object(fetch_servers.time, "monotonic", side_effect=lambda: next(ticks)), \
              mock.patch.object(fetch_servers.os, "urandom", return_value=b"12345678"):
             alive, ping = fetch_servers.check_udp_health("198.51.100.1", 1194)
         self.assertTrue(alive)
         self.assertEqual(fake.sent[0], b"\x38" + b"12345678" + b"\x00" + (1).to_bytes(4, "big"))
-        self.assertEqual(ping, 25)
+        self.assertEqual(ping, 30)
 
     def test_vpngate_speed_mbps(self):
         import base64
