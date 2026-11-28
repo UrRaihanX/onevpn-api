@@ -773,9 +773,9 @@ def run_openvpn_end_to_end(item: dict):
         if needs_auth:
             auth_path = os.path.join(temp_dir, "auth.txt")
             with open(auth_path, "w", encoding="utf-8") as auth_file:
-                auth_file.write(username + "\\n" + password + "\\n")
+                auth_file.write(username + "\n" + password + "\n")
             os.chmod(auth_path, 0o600)
-            profile += f"auth-user-pass {auth_path}\\n"
+            profile += f"auth-user-pass {auth_path}\n"
         log_path = os.path.join(temp_dir, "openvpn.log")
         pid_path = os.path.join(temp_dir, "openvpn.pid")
         with open(config_path, "w", encoding="utf-8") as handle:
