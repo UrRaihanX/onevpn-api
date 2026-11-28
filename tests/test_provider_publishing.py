@@ -115,9 +115,16 @@ KEY
         self.assertEqual(next(iter(unique.values()))["source"], "VPNGate")
 
     def test_aes_256_cbc_is_preserved(self):
-        patched = fetch_servers.patch_ovpn_config("client\n", False)
+        patched = fetch_servers.patch_ovpn_config("client\\ncipher AES-256-CBC\\n", False)
         self.assertIn("AES-256-CBC", patched)
         self.assertIn("AES-128-CBC", patched)
+        self.assertIn("data-ciphers-fallback AES-256-CBC", patched)
+        self.assertNotIn("data-ciphers-fallback AES-256-CBC:AES-128-CBC", patched)
+
+    def test_aes_128_cbc_is_selected_as_single_fallback_when_declared(self):
+        patched = fetch_servers.patch_ovpn_config("client\\ncipher AES-128-CBC\\n", False)
+        self.assertIn("data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305", patched)
+        self.assertIn("data-ciphers-fallback AES-128-CBC", patched)
 
     def test_private_or_unknown_source_is_rejected(self):
         record = {

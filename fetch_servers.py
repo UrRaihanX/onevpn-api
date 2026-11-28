@@ -255,6 +255,14 @@ def enrich_with_geoip(servers: list):
 
 def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
     """Normalize third-party profiles for modern OpenVPN and Android openvpn_flutter."""
+    # data-ciphers-fallback accepts exactly one cipher (unlike data-ciphers).
+    # Preserve a supported legacy cipher declared by the original server profile.
+    declared_cipher = re.search(r"(?im)^\s*cipher\s+([A-Za-z0-9-]+)", ovpn_text)
+    fallback_cipher = (
+        declared_cipher.group(1).upper()
+        if declared_cipher and declared_cipher.group(1).upper() in {"AES-256-CBC", "AES-128-CBC"}
+        else "AES-256-CBC"
+    )
     output = []
     skip_inline_auth = False
     seen = set()
@@ -283,7 +291,7 @@ def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
                 value = (
                     "AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305"
                     if directive == "data-ciphers"
-                    else "AES-256-CBC:AES-128-CBC"
+                    else fallback_cipher
                 )
                 output.append(f"{directive} {value}")
                 seen.add(directive)
@@ -293,7 +301,7 @@ def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
 
     required = [
         ('data-ciphers', "data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305"),
-        ('data-ciphers-fallback', "data-ciphers-fallback AES-256-CBC:AES-128-CBC"),
+        ('data-ciphers-fallback', f"data-ciphers-fallback {fallback_cipher}"),
         ('pull-filter-route-ipv6', 'pull-filter ignore "route-ipv6"'),
         ('pull-filter-ifconfig-ipv6', 'pull-filter ignore "ifconfig-ipv6"'),
         ('dhcp-option-dns-1.1.1.1', "dhcp-option DNS 1.1.1.1"),
