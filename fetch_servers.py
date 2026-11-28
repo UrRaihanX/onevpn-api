@@ -7,6 +7,9 @@ import shutil
 import socket
 import base64
 import threading
+import subprocess
+import tempfile
+import ipaddress
 import requests
 from io import StringIO
 from collections import Counter
@@ -28,14 +31,20 @@ GITHUB_REPOS = [
 ]
 
 SIMPLE_SCRAPE_SITES = [
-    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php"},
     {"name": "OpenProxyList", "url": "https://openproxylist.com/openvpn/"},
 ]
 
+# IPSpeed permits one profile download every 10 seconds. Use a browser session
+# and enforce that limit. HuntVPN and PublicVPNList require approved access
+# before automated collection or permanent republication.
 BROWSER_SCRAPE_SITES = [
-    {"name": "HuntVPN", "url": "https://huntvpn.dev/servers"},
-    {"name": "PublicVPNList", "url": "https://publicvpnlist.com/openvpn-configs/"},
+    {"name": "IPSpeed", "url": "https://ipspeed.info/free-openvpn.php"},
 ]
+
+POLICY_RESTRICTED_SOURCES = {
+    "HuntVPN": "automated scraping and mirroring are prohibited by the site's terms",
+    "PublicVPNList": "API access requires an issued key and permanent automated mirroring is prohibited",
+}
 
 HEADERS = {
     "User-Agent": (
@@ -381,8 +390,10 @@ def fetch_simple_sites():
 
 
 def fetch_with_playwright():
-    """Collect rendered download links and inspect detail pages for downloadable profiles."""
+    """Collect IPSpeed profiles through a browser while respecting its download limit."""
     candidates = []
+    for source_name, reason in POLICY_RESTRICTED_SOURCES.items():
+        print(f"{source_name}: skipped; {reason}. Request approved bulk access before enabling.")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -432,14 +443,31 @@ def fetch_with_playwright():
                                 if value.startswith("/") or value.startswith("http"):
                                     urls.add(urljoin(site["url"], value))
 
-                    # Inspect a bounded number of candidate pages; only accept actual OpenVPN profiles.
+                    # Prefer direct .ovpn links. IPSpeed limits profile downloads to
+                    # one every 10 seconds; cap each run to six profiles and honour it.
+                    candidate_urls = sorted(
+                        urls,
+                        key=lambda value: (".ovpn" not in value.lower(), value),
+                    )
+                    if site["name"] == "IPSpeed":
+                        candidate_urls = [u for u in candidate_urls if ".ovpn" in u.lower()][:6]
+                    else:
+                        candidate_urls = candidate_urls[:60]
+
                     checked = 0
-                    for url in list(urls)[:100]:
+                    last_download_at = None
+                    for url in candidate_urls:
                         if checked >= 60:
                             break
+                        if site["name"] == "IPSpeed" and last_download_at is not None:
+                            delay = 10.0 - (time.monotonic() - last_download_at)
+                            if delay > 0:
+                                time.sleep(delay)
                         checked += 1
                         try:
-                            result = context.request.get(url, timeout=15000)
+                            result = context.request.get(url, timeout=20000)
+                            if site["name"] == "IPSpeed":
+                                last_download_at = time.monotonic()
                             if not result.ok:
                                 continue
                             body = result.text().lstrip("\ufeff")
@@ -485,6 +513,233 @@ def fetch_with_playwright():
     except Exception as e:
         print(f"Browser Launch Error: {e}")
     return candidates
+
+
+def install_openvpn_client():
+    """Install OpenVPN on an ephemeral CI runner if it is not already available."""
+    if shutil.which("openvpn"):
+        return True
+    if not shutil.which("sudo") or not shutil.which("apt-get"):
+        print("VPN E2E skipped: OpenVPN CLI is unavailable on this runner.")
+        return False
+    try:
+        update = subprocess.run(
+            ["sudo", "apt-get", "update", "-qq"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if update.returncode != 0:
+            print("VPN E2E skipped: package index update failed.")
+            return False
+        install = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", "-qq", "openvpn", "curl", "iproute2"],
+            capture_output=True, text=True, timeout=180,
+        )
+        if install.returncode != 0 or not shutil.which("openvpn"):
+            print("VPN E2E skipped: OpenVPN client installation failed.")
+            return False
+        return True
+    except Exception as exc:
+        print(f"VPN E2E skipped: could not prepare OpenVPN client ({exc}).")
+        return False
+
+
+def make_safe_test_profile(ovpn_text: str):
+    """Strip executable hooks and route-changing directives from third-party profiles."""
+    output = []
+    in_inline_block = False
+    requires_credentials = False
+    for raw_line in ovpn_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            output.append(raw_line)
+            continue
+        if stripped.startswith("<") and not stripped.startswith("</"):
+            block_name = stripped[1:].split(">", 1)[0].strip().lower()
+            if block_name == "auth-user-pass":
+                requires_credentials = True
+            in_inline_block = True
+            output.append(raw_line)
+            continue
+        if in_inline_block:
+            output.append(raw_line)
+            if stripped.startswith("</"):
+                in_inline_block = False
+            continue
+
+        parts = stripped.split(None, 1)
+        directive = parts[0].lower()
+        if directive == "auth-user-pass":
+            requires_credentials = True
+        if directive in {
+            "auth-user-pass", "daemon", "log", "log-append", "writepid",
+            "management", "plugin", "config", "up", "down", "route-up",
+            "ipchange", "client-connect", "client-disconnect", "learn-address",
+            "tls-verify", "script-security", "user", "group", "route",
+            "route-ipv6", "redirect-gateway", "redirect-private", "dhcp-option",
+            "setenv", "setenv-safe", "askpass", "auth-nocache",
+        }:
+            continue
+        if directive == "dev" and len(parts) > 1 and parts[1].strip().lower().startswith("tap"):
+            return None, "TAP profiles are not supported by this isolated test"
+        output.append(raw_line)
+
+    if requires_credentials:
+        return None, "profile requires username/password credentials"
+    output.extend([
+        "",
+        "# OneVPN isolated end-to-end test overrides",
+        "route-nopull",
+        "script-security 0",
+        "auth-nocache",
+        "nobind",
+        "persist-key",
+        "persist-tun",
+        "verb 3",
+    ])
+    return "\n".join(output) + "\n", None
+
+
+def run_openvpn_end_to_end(item: dict):
+    """Establish a real tunnel and verify HTTPS egress without changing the default route."""
+    profile, reason = make_safe_test_profile(item["_ovpn_text"])
+    if not profile:
+        return False, reason
+    if not os.path.exists("/dev/net/tun"):
+        return False, "runner has no /dev/net/tun device"
+
+    with tempfile.TemporaryDirectory(prefix="onevpn-e2e-") as temp_dir:
+        config_path = os.path.join(temp_dir, "test.ovpn")
+        log_path = os.path.join(temp_dir, "openvpn.log")
+        pid_path = os.path.join(temp_dir, "openvpn.pid")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            handle.write(profile)
+
+        process = None
+        route_ip = None
+        route_added = False
+        try:
+            process = subprocess.Popen(
+                [
+                    "sudo", "openvpn", "--config", config_path,
+                    "--route-nopull", "--script-security", "0",
+                    "--connect-retry-max", "1", "--connect-timeout", "12",
+                    "--verb", "3", "--log", log_path, "--writepid", pid_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            deadline = time.monotonic() + 28
+            connected = False
+            while time.monotonic() < deadline:
+                if os.path.exists(log_path):
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as handle:
+                        log_text = handle.read()
+                    if "Initialization Sequence Completed" in log_text:
+                        connected = True
+                        break
+                    if any(marker in log_text for marker in (
+                        "AUTH_FAILED", "Exiting due to fatal error", "Options error",
+                    )):
+                        return False, "OpenVPN rejected the profile or authentication"
+                if process.poll() is not None:
+                    break
+                time.sleep(0.5)
+
+            if not connected:
+                return False, "OpenVPN tunnel did not initialize within 28 seconds"
+
+            links = subprocess.run(
+                ["ip", "-o", "link", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            match = re.search(r"\d+:\s+(tun\d+):", links.stdout)
+            if not match:
+                return False, "OpenVPN connected but no TUN interface was found"
+            tun_device = match.group(1)
+
+            route_ip = socket.gethostbyname("api.ipify.org")
+            route_result = subprocess.run(
+                ["sudo", "ip", "route", "add", f"{route_ip}/32", "dev", tun_device],
+                capture_output=True, text=True, timeout=5,
+            )
+            if route_result.returncode != 0:
+                return False, "tunnel came up but an isolated egress route could not be added"
+            route_added = True
+
+            egress = subprocess.run(
+                [
+                    "curl", "-4", "--interface", tun_device, "--fail", "--silent",
+                    "--show-error", "--max-time", "12", "https://api.ipify.org",
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            if egress.returncode != 0:
+                return False, "tunnel initialized but HTTPS traffic did not pass through it"
+            try:
+                exit_ip = ipaddress.ip_address(egress.stdout.strip())
+            except ValueError:
+                return False, "tunnel returned an invalid egress-IP response"
+            if not exit_ip.is_global:
+                return False, "tunnel egress did not return a public IP"
+            return True, f"tunnel and HTTPS egress verified ({exit_ip})"
+        except Exception as exc:
+            return False, f"end-to-end test error: {exc}"
+        finally:
+            if route_added and route_ip:
+                try:
+                    subprocess.run(
+                        ["sudo", "ip", "route", "del", f"{route_ip}/32"],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+            try:
+                if os.path.exists(pid_path):
+                    with open(pid_path, "r", encoding="utf-8") as handle:
+                        openvpn_pid = handle.read().strip()
+                    if openvpn_pid.isdigit():
+                        subprocess.run(
+                            ["sudo", "kill", "-TERM", openvpn_pid],
+                            capture_output=True, timeout=5,
+                        )
+                elif process and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+            except Exception:
+                if process and process.poll() is None:
+                    process.kill()
+
+
+def run_end_to_end_checks(healthy_servers: list):
+    """Test one real TCP and one real UDP tunnel when candidates are available."""
+    if os.environ.get("RUN_E2E_TESTS", "1").strip().lower() in {"0", "false", "no"}:
+        print("VPN E2E checks disabled by RUN_E2E_TESTS.")
+        return
+    if not healthy_servers:
+        print("VPN E2E checks skipped: no health-checked servers.")
+        return
+    if not install_openvpn_client():
+        return
+
+    checked_protocols = set()
+    passed = 0
+    for server in healthy_servers:
+        proto = server["protocol"]
+        if proto not in {"tcp", "udp"} or proto in checked_protocols:
+            continue
+        checked_protocols.add(proto)
+        ok, detail = run_openvpn_end_to_end(server)
+        print(
+            f"VPN E2E {'PASS' if ok else 'FAIL'}: {server['source']} "
+            f"{proto.upper()} {server['ip']}:{server['port']} - {detail}"
+        )
+        if ok:
+            passed += 1
+        if len(checked_protocols) >= 2:
+            break
+    print(f"VPN E2E summary: {passed}/{len(checked_protocols)} protocol tunnel checks passed.")
 
 def process_server(item):
     alive, ping_ms = check_server_health(
@@ -591,6 +846,8 @@ def main():
 
     live_counts = Counter(s["source"] for s in healthy_servers)
     print(f"Live servers by source: {dict(live_counts)}")
+
+    run_end_to_end_checks(healthy_servers)
 
     if len(healthy_servers) < MIN_SERVERS_THRESHOLD:
         print(
