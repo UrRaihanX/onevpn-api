@@ -360,7 +360,7 @@ def fetch_vpngate():
 
 
 def fetch_riseup():
-    """Fetch Riseup's official LEAP API and create self-contained OpenVPN profiles."""
+    """Fetch Riseup credentials for isolated CI tests only; never publish these profiles."""
     candidates = []
     ca_url = "https://raw.githubusercontent.com/leapcode/bitmask-vpn/main/providers/riseup/riseup-ca.crt"
     api = "https://api.black.riseup.net/3"
@@ -457,6 +457,7 @@ def fetch_riseup():
                         "username": "",
                         "password": "",
                         "requires_auth": False,
+                        "publishable": False,
                     })
             print(f"RiseupVPN: collected {len(candidates)} OpenVPN gateway profiles")
     except Exception as exc:
@@ -922,13 +923,42 @@ def run_end_to_end_checks(healthy_servers: list):
     if not install_openvpn_client():
         return
 
-    checked_protocols = set()
     passed = 0
+    checked = 0
+
+    # Riseup's /3/cert key is shared by all gateway candidates from this API
+    # response. Use it only in ephemeral CI test files, never in public output.
+    riseup_checked = set()
     for server in healthy_servers:
+        if server.get("source") != "riseup":
+            continue
+        proto = server["protocol"]
+        if proto not in {"tcp", "udp"} or proto in riseup_checked:
+            continue
+        riseup_checked.add(proto)
+        checked += 1
+        ok, detail = run_openvpn_end_to_end(server)
+        print(
+            f"RISEUP E2E {'PASS' if ok else 'FAIL'}: "
+            f"{proto.upper()} {server['ip']}:{server['port']} - {detail}"
+        )
+        if ok:
+            passed += 1
+        if len(riseup_checked) == 2:
+            break
+    if not riseup_checked:
+        print("RISEUP E2E SKIPPED: no health-checked Riseup TCP/UDP endpoints were available.")
+
+    # Retain the existing independent TCP/UDP regression checks for publishable sources.
+    checked_protocols = set()
+    for server in healthy_servers:
+        if not server.get("_publishable", True):
+            continue
         proto = server["protocol"]
         if proto not in {"tcp", "udp"} or proto in checked_protocols:
             continue
         checked_protocols.add(proto)
+        checked += 1
         ok, detail = run_openvpn_end_to_end(server)
         print(
             f"VPN E2E {'PASS' if ok else 'FAIL'}: {server['source']} "
@@ -938,7 +968,7 @@ def run_end_to_end_checks(healthy_servers: list):
             passed += 1
         if len(checked_protocols) >= 2:
             break
-    print(f"VPN E2E summary: {passed}/{len(checked_protocols)} protocol tunnel checks passed.")
+    print(f"VPN E2E summary: {passed}/{checked} tunnel checks passed (Riseup isolated + public-source regression).")
 
 def process_server(item):
     alive, ping_ms = check_server_health(
@@ -964,6 +994,7 @@ def process_server(item):
         "isp": "Unknown",
         "ping_ms": ping_ms,
         "source": item["source"],
+        "_publishable": bool(item.get("publishable", True)),
         "username": item.get("username", ""),
         "password": item.get("password", ""),
         "config_path": config_path,
@@ -985,6 +1016,7 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
 
     for server in healthy_servers:
         ovpn_text = server.pop("_ovpn_text")
+        server.pop("_publishable", None)
         ovpn_file = os.path.join(output_dir, server["config_path"])
         with open(ovpn_file, "w", encoding="utf-8") as f:
             f.write(ovpn_text)
@@ -1068,18 +1100,25 @@ def main():
 
     run_end_to_end_checks(healthy_servers)
 
-    if len(healthy_servers) < MIN_SERVERS_THRESHOLD:
+    publishable_servers = [server for server in healthy_servers if server.get("_publishable", True)]
+    isolated_riseup_count = len(healthy_servers) - len(publishable_servers)
+    print(
+        f"Publication security filter: excluded {isolated_riseup_count} Riseup profiles "
+        "containing private credentials from public data output."
+    )
+
+    if len(publishable_servers) < MIN_SERVERS_THRESHOLD:
         print(
-            f"Safety guard triggered: only {len(healthy_servers)} live servers found "
+            f"Safety guard triggered: only {len(publishable_servers)} publishable live servers found "
             f"(minimum required: {MIN_SERVERS_THRESHOLD}). Skipping output generation."
         )
         return
 
-    print(f"Running GeoIP lookup for {len(healthy_servers)} live servers...")
-    enrich_with_geoip(healthy_servers)
+    print(f"Running GeoIP lookup for {len(publishable_servers)} publishable live servers...")
+    enrich_with_geoip(publishable_servers)
 
-    healthy_servers.sort(key=lambda x: x["ping_ms"])
-    write_output_bundle(healthy_servers, OUTPUT_DIR)
+    publishable_servers.sort(key=lambda x: x["ping_ms"])
+    write_output_bundle(publishable_servers, OUTPUT_DIR)
 
     meta_kb = os.path.getsize(os.path.join(OUTPUT_DIR, "servers_meta.json")) / 1024
     full_kb = os.path.getsize(os.path.join(OUTPUT_DIR, "servers.json")) / 1024
