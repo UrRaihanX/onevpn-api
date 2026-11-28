@@ -809,7 +809,7 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
             )
         ovpn_text = str(server.get("_ovpn_text", ""))
         if re.search(
-            r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----|<key>\\s*-----BEGIN",
+            r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----|<key>\s*-----BEGIN",
             ovpn_text,
             re.IGNORECASE,
         ):
