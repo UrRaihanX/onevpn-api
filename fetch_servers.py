@@ -142,8 +142,11 @@ def check_tcp_health(ip: str, port: int, has_tls_key: bool = False):
     start_time = time.monotonic()
     try:
         with socket.create_connection((ip, port), timeout=HEALTH_CHECK_TIMEOUT) as sock:
+            # TCP connect duration is the network RTT measurement. Do not
+            # include OpenVPN server-side control-channel processing latency.
+            connect_ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
             if has_tls_key:
-                return True, max(1, int((time.monotonic() - start_time) * 1000))
+                return True, connect_ping_ms
             sock.settimeout(HEALTH_CHECK_TIMEOUT)
             # TCP transport frames each OpenVPN packet with a 2-byte network-order length.
             session_id = os.urandom(8)
@@ -173,8 +176,7 @@ def check_tcp_health(ip: str, port: int, has_tls_key: bool = False):
             if opcode not in (4, 8):
                 return False, None
 
-            ping_ms = max(1, int((time.monotonic() - start_time) * 1000))
-            return True, ping_ms
+            return True, connect_ping_ms
     except Exception:
         return False, None
 
