@@ -403,7 +403,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
         api_root = f"{api_uri}/{api_version}"
         gateways_response = requests.get(
             f"{api_root}/config/eip-service.json",
-            headers=HEADERS, timeout=(8, 30), verify=ca_path,
+            headers=HEADERS, timeout=(8, 30), verify=True,
         )
         gateways_response.raise_for_status()
         service = gateways_response.json()
@@ -413,7 +413,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
 
         # Request one shared client credential bundle per provider, not per gateway.
         cert_response = requests.get(
-            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=ca_path,
+            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=True,
         )
         cert_response.raise_for_status()
         cert_bundle = cert_response.text
@@ -778,9 +778,10 @@ def run_openvpn_end_to_end(item: dict):
                         "VERIFY ERROR", "TLS Error", "Connection refused",
                     )
                     if any(marker in log_text for marker in failure_markers):
-                        diagnostic = next((line.strip() for line in reversed(log_text.splitlines())
-                                           if any(marker in line for marker in failure_markers)), "")
-                        return False, "OpenVPN failed: " + (diagnostic[:220] or "unknown handshake/authentication error")
+                        log_tail = " | ".join(
+                            line.strip() for line in log_text.splitlines()[-8:] if line.strip()
+                        )
+                        return False, "OpenVPN failed: " + (log_tail[-700:] or "unknown handshake/authentication error")
                 if process.poll() is not None:
                     break
                 time.sleep(0.5)
