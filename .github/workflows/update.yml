@@ -1,6 +1,8 @@
 name: Update OneVPN Servers
 
 on:
+  push:
+    branches: [main]
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
