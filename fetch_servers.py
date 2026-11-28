@@ -627,6 +627,7 @@ def run_openvpn_end_to_end(item: dict):
     with tempfile.TemporaryDirectory(prefix="onevpn-e2e-") as temp_dir:
         config_path = os.path.join(temp_dir, "test.ovpn")
         log_path = os.path.join(temp_dir, "openvpn.log")
+        pid_path = os.path.join(temp_dir, "openvpn.pid")
         with open(config_path, "w", encoding="utf-8") as handle:
             handle.write(profile)
         # Pre-create the log as the runner user so the non-root Python process
@@ -634,6 +635,10 @@ def run_openvpn_end_to_end(item: dict):
         with open(log_path, "w", encoding="utf-8"):
             pass
         os.chmod(log_path, 0o666)
+        # Keep the PID file runner-readable for reliable cleanup of the sudo child.
+        with open(pid_path, "w", encoding="utf-8"):
+            pass
+        os.chmod(pid_path, 0o666)
 
         process = None
         route_ip = None
@@ -644,7 +649,7 @@ def run_openvpn_end_to_end(item: dict):
                     "sudo", "openvpn", "--config", config_path,
                     "--route-nopull", "--script-security", "0",
                     "--connect-retry-max", "1", "--connect-timeout", "12",
-                    "--verb", "3", "--log", log_path,
+                    "--verb", "3", "--log", log_path, "--writepid", pid_path,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -717,7 +722,15 @@ def run_openvpn_end_to_end(item: dict):
                 except Exception:
                     pass
             try:
-                if process and process.poll() is None:
+                if os.path.exists(pid_path):
+                    with open(pid_path, "r", encoding="utf-8") as handle:
+                        openvpn_pid = handle.read().strip()
+                    if openvpn_pid.isdigit():
+                        subprocess.run(
+                            ["sudo", "kill", "-TERM", openvpn_pid],
+                            capture_output=True, timeout=5,
+                        )
+                elif process and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
             except Exception:
