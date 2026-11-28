@@ -373,7 +373,6 @@ def fetch_vpngate():
 def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str):
     """Discover a LEAP provider dynamically and build Android-compatible OpenVPN profiles."""
     candidates = []
-    ca_path = None
     try:
         try:
             provider_response = requests.get(provider_url, headers=HEADERS, timeout=(8, 20))
@@ -402,13 +401,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
         if "-----BEGIN CERTIFICATE-----" not in ca_pem:
             raise ValueError(f"{provider_name} CA endpoint did not return a PEM certificate")
 
-        # Use a real .crt file for requests' CA bundle verification and always unlink it.
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", suffix=".crt",
-            prefix=f"onevpn-{source_slug}-", delete=False,
-        ) as ca_file:
-            ca_file.write(ca_pem + "\n")
-            ca_path = ca_file.name
+        # The provider CA is embedded in each generated OpenVPN profile.
 
         api_root = f"{api_uri}/{api_version}"
         gateways_response = requests.get(
@@ -560,12 +553,6 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
         print(f"{provider_name}: collected {len(candidates)} OpenVPN gateway profiles")
     except Exception as exc:
         print(f"{provider_name} Error: {exc}")
-    finally:
-        if ca_path and os.path.exists(ca_path):
-            try:
-                os.remove(ca_path)
-            except OSError as exc:
-                print(f"{provider_name}: could not remove temporary CA file: {exc}")
     return candidates
 
 
