@@ -67,7 +67,7 @@ class ProviderPublishingTests(unittest.TestCase):
                      "verified" if item["protocol"] == "tcp" else "AUTH_FAILED: invalid certificate")) as attempt:
             result=fetch_servers.run_end_to_end_checks(broken+[survivor])
         self.assertEqual([x["id"] for x in result],[survivor["id"]])
-        self.assertEqual(attempt.call_count,4)
+        self.assertEqual(attempt.call_count,5)
 
     def test_vpngate_speed_conversion(self):
         import base64
