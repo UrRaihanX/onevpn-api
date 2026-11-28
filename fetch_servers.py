@@ -10,9 +10,8 @@ import threading
 import subprocess
 import tempfile
 import ipaddress
-import zipfile
 import requests
-from io import StringIO, BytesIO
+from io import StringIO
 from collections import Counter
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
@@ -378,7 +377,7 @@ def fetch_riseup():
 
             gateways_response = requests.get(
                 f"{api}/config/eip-service.json", headers=HEADERS,
-                verify=ca_path, timeout=30,
+                timeout=30,
             )
             gateways_response.raise_for_status()
             service = gateways_response.json()
@@ -387,7 +386,7 @@ def fetch_riseup():
                 raise ValueError("Riseup API returned no gateways")
 
             cert_response = requests.get(
-                f"{api}/cert", headers=HEADERS, verify=ca_path, timeout=30,
+                f"{api}/cert", headers=HEADERS, timeout=30,
             )
             cert_response.raise_for_status()
             credential_bundle = cert_response.text
@@ -462,80 +461,6 @@ def fetch_riseup():
             print(f"RiseupVPN: collected {len(candidates)} OpenVPN gateway profiles")
     except Exception as exc:
         print(f"RiseupVPN Error: {exc}")
-    return candidates
-
-
-def fetch_vpnbook():
-    """Download VPNBook OpenVPN ZIP profiles only when a live page password is parsed."""
-    candidates = []
-    page_url = "https://www.vpnbook.com/freevpn"
-    try:
-        response = requests.get(page_url, headers=HEADERS, timeout=30)
-        response.raise_for_status()
-        html = response.text
-        soup = BeautifulSoup(html, "html.parser")
-        visible_text = soup.get_text(" ", strip=True)
-        combined = visible_text + "\n" + html
-        password = None
-        patterns = [
-            r"(?i)password\s*[:：]\s*(?:</?[^>]+>\s*)*([A-Za-z0-9!@#$%^&*()_+=.-]{5,})",
-            r"(?i)Password.{0,180}?<[^>]*>\s*([A-Za-z0-9!@#$%^&*()_+=.-]{5,})\s*</",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, combined)
-            if match:
-                candidate_password = match.group(1).strip()
-                if candidate_password.lower() not in {"updated", "changed", "password"}:
-                    password = candidate_password
-                    break
-        if not password:
-            text_match = re.search(r"(?i)password\s*[:：]\s*([A-Za-z0-9!@#$%^&*()_+=.-]{5,})", visible_text)
-            if text_match:
-                password = text_match.group(1).strip()
-        if not password:
-            print("VPNBook Warning: live password could not be reliably extracted; skipping this source.")
-            return candidates
-
-        archive_urls = set()
-        for anchor in soup.find_all("a", href=True):
-            href = urljoin(response.url, anchor["href"].strip())
-            if re.search(r"vpnbook-openvpn-[^/?#]+\.zip(?:[?#]|$)", href, re.I):
-                archive_urls.add(href.split("?", 1)[0])
-        # Include links embedded in scripts/RSC payloads.
-        for match in re.findall(r"""(?:https?:)?//[^"'\\\s<>]+vpnbook-openvpn-[^"'\\\s<>]+\.zip|/[^"'\\\s<>]*vpnbook-openvpn-[^"'\\\s<>]+\.zip""", html, re.I):
-            archive_urls.add(urljoin(response.url, match))
-        if not archive_urls:
-            print("VPNBook Warning: no vpnbook-openvpn-*.zip links found; skipping this source.")
-            return candidates
-
-        for archive_url in sorted(archive_urls):
-            try:
-                archive_response = requests.get(archive_url, headers=HEADERS, timeout=45)
-                archive_response.raise_for_status()
-                with zipfile.ZipFile(BytesIO(archive_response.content)) as archive:
-                    for member in archive.namelist():
-                        if not member.lower().endswith(".ovpn") or member.startswith("__MACOSX/"):
-                            continue
-                        try:
-                            profile = archive.read(member).decode("utf-8-sig", errors="replace")
-                            if "remote " not in profile.lower() or not re.search(r"(?im)^\s*dev\s+(?:tun|tap)", profile):
-                                continue
-                            candidates.append({
-                                "ovpn_text": profile,
-                                "country": "Unknown",
-                                "country_code": "XX",
-                                "source": "vpnbook",
-                                "username": "vpnbook",
-                                "password": password,
-                                "requires_auth": True,
-                            })
-                        except Exception as exc:
-                            print(f"VPNBook profile parse error ({member}): {exc}")
-            except Exception as exc:
-                print(f"VPNBook archive error ({archive_url}): {exc}")
-        print(f"VPNBook: collected {len(candidates)} OpenVPN profiles")
-    except Exception as exc:
-        print(f"VPNBook Error: {exc}")
     return candidates
 
 
@@ -775,29 +700,31 @@ def make_safe_test_profile(ovpn_text: str):
     """Strip executable hooks and route-changing directives from third-party profiles."""
     output = []
     in_inline_block = False
-    requires_credentials = False
+    skip_inline_block = False
     for raw_line in ovpn_text.splitlines():
         stripped = raw_line.strip()
+        if in_inline_block:
+            if stripped.startswith("</"):
+                in_inline_block = False
+                if not skip_inline_block:
+                    output.append(raw_line)
+                skip_inline_block = False
+            elif not skip_inline_block:
+                output.append(raw_line)
+            continue
         if not stripped or stripped.startswith(("#", ";")):
             output.append(raw_line)
             continue
         if stripped.startswith("<") and not stripped.startswith("</"):
             block_name = stripped[1:].split(">", 1)[0].strip().lower()
-            if block_name == "auth-user-pass":
-                requires_credentials = True
+            skip_inline_block = block_name == "auth-user-pass"
             in_inline_block = True
-            output.append(raw_line)
-            continue
-        if in_inline_block:
-            output.append(raw_line)
-            if stripped.startswith("</"):
-                in_inline_block = False
+            if not skip_inline_block:
+                output.append(raw_line)
             continue
 
         parts = stripped.split(None, 1)
         directive = parts[0].lower()
-        if directive == "auth-user-pass":
-            requires_credentials = True
         if directive in {
             "auth-user-pass", "daemon", "log", "log-append", "writepid",
             "management", "plugin", "config", "up", "down", "route-up",
@@ -811,8 +738,6 @@ def make_safe_test_profile(ovpn_text: str):
             return None, "TAP profiles are not supported by this isolated test"
         output.append(raw_line)
 
-    if requires_credentials:
-        return None, "profile requires username/password credentials"
     output.extend([
         "",
         "# OneVPN isolated end-to-end test overrides",
@@ -832,11 +757,25 @@ def run_openvpn_end_to_end(item: dict):
     profile, reason = make_safe_test_profile(item["_ovpn_text"])
     if not profile:
         return False, reason
+    needs_auth = bool(re.search(
+        r"(?im)^\\s*auth-user-pass(?:\\s|$)|<auth-user-pass>",
+        item["_ovpn_text"],
+    ))
+    username = str(item.get("username") or "")
+    password = str(item.get("password") or "")
+    if needs_auth and (not username or not password):
+        return False, "profile requires credentials that are not available"
     if not os.path.exists("/dev/net/tun"):
         return False, "runner has no /dev/net/tun device"
 
     with tempfile.TemporaryDirectory(prefix="onevpn-e2e-") as temp_dir:
         config_path = os.path.join(temp_dir, "test.ovpn")
+        if needs_auth:
+            auth_path = os.path.join(temp_dir, "auth.txt")
+            with open(auth_path, "w", encoding="utf-8") as auth_file:
+                auth_file.write(username + "\\n" + password + "\\n")
+            os.chmod(auth_path, 0o600)
+            profile += f"auth-user-pass {auth_path}\\n"
         log_path = os.path.join(temp_dir, "openvpn.log")
         pid_path = os.path.join(temp_dir, "openvpn.pid")
         with open(config_path, "w", encoding="utf-8") as handle:
@@ -1083,7 +1022,6 @@ def main():
     source_fetchers = [
         ("VPNGate", fetch_vpngate),
         ("RiseupVPN", fetch_riseup),
-        ("VPNBook", fetch_vpnbook),
         ("OpenProxyList", fetch_simple_sites),
         ("IPSpeed", fetch_with_playwright),
     ]
