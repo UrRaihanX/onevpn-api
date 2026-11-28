@@ -584,10 +584,6 @@ def fetch_github_ovpn_repository(repository: str, source_name: str):
     return candidates
 
 
-def fetch_zoult():
-    return fetch_github_ovpn_repository("Zoult/.ovpn", "Zoult/.ovpn")
-
-
 def fetch_fox3000foxy():
     return fetch_github_ovpn_repository(
         "fox3000foxy/OVPN-Configs-scraper",
@@ -922,7 +918,7 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
     # approved for public .ovpn distribution; Bitmask credentials refresh each run.
     for server in healthy_servers:
         source = str(server.get("source", "")).strip().lower()
-        if source not in {"vpngate", "riseup", "calyx", "zoult/.ovpn", "fox3000foxy/ovpn-configs-scraper"} or not server.get("_publishable", True):
+        if source not in {"vpngate", "riseup", "calyx", "fox3000foxy/ovpn-configs-scraper"} or not server.get("_publishable", True):
             raise ValueError(
                 f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
             )
@@ -977,7 +973,6 @@ def main():
     raw_candidates = []
     source_fetchers = [
         ("VPNGate", fetch_vpngate),
-        ("Zoult/.ovpn", fetch_zoult),
         ("fox3000foxy/OVPN-Configs-scraper", fetch_fox3000foxy),
         ("RiseupVPN", fetch_riseup),
         ("CalyxVPN", fetch_calyx),
