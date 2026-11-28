@@ -445,7 +445,9 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
             capabilities = gateway.get("capabilities", {}) or {}
             transports = capabilities.get("transport", []) or []
             openvpn_transports = [item for item in transports if str(item.get("type", "")).lower() == "openvpn"]
-            selected_transport = None
+            # Keep one usable transport for EACH advertised protocol. The old
+            # UDP-first selection silently discarded TCP when a gateway offered both.
+            selected_transports = {}
             for preferred_proto in ("udp", "tcp"):
                 for item in openvpn_transports:
                     values = item.get("protocols") or [item.get("protocol", "")]
@@ -463,11 +465,13 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
                         except (TypeError, ValueError):
                             continue
                     if valid_ports:
-                        selected_transport = {"type": "openvpn", "protocols": [preferred_proto], "ports": valid_ports}
+                        selected_transports[preferred_proto] = {
+                            "type": "openvpn",
+                            "protocols": [preferred_proto],
+                            "ports": valid_ports,
+                        }
                         break
-                if selected_transport:
-                    break
-            transports = [selected_transport] if selected_transport else []
+            transports = list(selected_transports.values())
             for transport in transports:
                 if str(transport.get("type", "")).lower() != "openvpn":
                     continue
@@ -547,8 +551,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
                     "requires_auth": False,
                     "publishable": True,
                 })
-                # Only the preferred OpenVPN transport is emitted for this gateway.
-                break
+                # Continue so a gateway advertising both protocols emits both profiles.
 
         print(f"{provider_name}: collected {len(candidates)} OpenVPN gateway profiles")
     except Exception as exc:
@@ -904,7 +907,9 @@ def run_end_to_end_checks(healthy_servers: list):
         candidates = sorted(candidates, key=lambda server: server.get("ping_ms", float("inf")))
         checked += 1
         protocol_passed = False
+        attempted_ids = set()
         for server in candidates[:2]:
+            attempted_ids.add(server.get("id"))
             ok, detail = run_openvpn_end_to_end(server)
             print(f"{source.upper()} E2E {'PASS' if ok else 'ATTEMPT FAILED'}: "
                   f"{proto.upper()} {server['ip']}:{server['port']} - {detail}")
@@ -918,7 +923,19 @@ def run_end_to_end_checks(healthy_servers: list):
             print(f"{source.upper()} E2E FAIL: no working {proto.upper()} tunnel "
                   f"found in {min(len(candidates), 2)} attempted endpoint(s).")
 
-    print(f"VPN E2E summary: {passed}/{checked} provider/protocol checks passed.")
+    # Make missing protocol coverage explicit instead of silently omitting it.
+    expected_sources = {
+        "vpngate": "VPNGate",
+        "riseup": "RiseupVPN",
+        "calyx": "CalyxVPN",
+        "fox3000foxy/ovpn-configs-scraper": "Scraped",
+    }
+    for source, label in expected_sources.items():
+        for proto in ("tcp", "udp"):
+            if (source, proto) not in grouped:
+                print(f"{label} E2E {proto.upper()}: NOT AVAILABLE (no health-checked profile)")
+
+    print(f"VPN E2E summary: {passed}/{checked} available provider/protocol checks passed.")
     if failed_server_ids:
         before = len(healthy_servers)
         healthy_servers = [server for server in healthy_servers if server.get("id") not in failed_server_ids]
