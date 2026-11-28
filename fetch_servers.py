@@ -344,7 +344,7 @@ def fetch_vpngate():
 
 
 def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, source_slug: str):
-    """Fetch fresh Bitmask v3 credentials and build public OpenVPN profiles."""
+    """Fetch Bitmask v3 credentials using the provider CA and build OpenVPN profiles."""
     candidates = []
     api = api_base.rstrip("/")
     try:
@@ -353,60 +353,90 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
         ca_pem = ca_response.text.strip()
         if "BEGIN CERTIFICATE" not in ca_pem:
             raise ValueError(f"{provider_name} CA endpoint did not return a PEM certificate")
-        gateways_response = requests.get(f"{api}/3/config/eip-service.json", headers=HEADERS, timeout=30)
-        gateways_response.raise_for_status()
-        service = gateways_response.json()
-        gateways = service.get("gateways", [])
-        if not isinstance(gateways, list) or not gateways:
-            raise ValueError(f"{provider_name} API returned no gateways")
-        cert_response = requests.get(f"{api}/3/cert", headers=HEADERS, timeout=30)
-        cert_response.raise_for_status()
-        bundle = cert_response.text
-        cert_match = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", bundle, re.S)
-        key_match = re.search(r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z ]* )?PRIVATE KEY-----", bundle, re.S)
-        if not cert_match or not key_match:
-            raise ValueError(f"{provider_name} /3/cert response lacks a PEM certificate or private key")
-        client_cert, client_key = cert_match.group(0).strip(), key_match.group(0).strip()
-        locations = service.get("locations", {}) or {}
-        openvpn_options = service.get("openvpn_configuration", {}) or {}
-        for gateway in gateways:
-            caps = gateway.get("capabilities", {}) or {}
-            host = gateway.get("ip_address") or gateway.get("host")
-            if not host:
-                continue
-            endpoints = []
-            for transport in caps.get("transport") or []:
-                if str(transport.get("type", "")).lower() == "openvpn":
-                    for proto in transport.get("protocols", ["udp"]):
-                        for port in transport.get("ports", []):
-                            endpoints.append((str(proto).lower(), int(port)))
-            if not endpoints and "ports" in caps:
-                for proto in caps.get("protocols", ["udp"]):
-                    for port in caps.get("ports", []):
-                        endpoints.append((str(proto).lower(), int(port)))
-            location = gateway.get("location") or "Unknown"
-            info = locations.get(location, {}) if isinstance(locations, dict) else {}
-            country, cc = info.get("name") or location, normalize_country_code(info.get("country_code"))
-            for proto, port in endpoints:
-                if proto not in {"tcp", "udp"} or not 1 <= port <= 65535:
+
+        # Bitmask providers may use a private provider CA for their API TLS
+        # certificate. Trust that CA explicitly for both API requests.
+        with tempfile.TemporaryDirectory(prefix=f"onevpn-{source_slug}-ca-") as temp_dir:
+            ca_path = os.path.join(temp_dir, "provider-ca.pem")
+            with open(ca_path, "w", encoding="utf-8") as handle:
+                handle.write(ca_pem + "\\n")
+
+            gateways_response = requests.get(
+                f"{api}/3/config/eip-service.json", headers=HEADERS,
+                timeout=30, verify=ca_path,
+            )
+            gateways_response.raise_for_status()
+            service = gateways_response.json()
+            gateways = service.get("gateways", [])
+            if not isinstance(gateways, list) or not gateways:
+                raise ValueError(f"{provider_name} API returned no gateways")
+
+            cert_response = requests.get(
+                f"{api}/3/cert", headers=HEADERS, timeout=30, verify=ca_path,
+            )
+            cert_response.raise_for_status()
+            bundle = cert_response.text
+            cert_match = re.search(
+                r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", bundle, re.S
+            )
+            key_match = re.search(
+                r"-----BEGIN (?:[A-Z ]* )?PRIVATE KEY-----.*?-----END (?:[A-Z ]* )?PRIVATE KEY-----",
+                bundle, re.S,
+            )
+            if not cert_match or not key_match:
+                raise ValueError(f"{provider_name} /3/cert response lacks a PEM certificate or private key")
+            client_cert, client_key = cert_match.group(0).strip(), key_match.group(0).strip()
+            locations = service.get("locations", {}) or {}
+            openvpn_options = service.get("openvpn_configuration", {}) or {}
+
+            for gateway in gateways:
+                caps = gateway.get("capabilities", {}) or {}
+                host = gateway.get("ip_address") or gateway.get("host")
+                if not host:
                     continue
-                lines = ["client", "dev tun", f"proto {proto}-client" if proto == "tcp" else "proto udp",
-                         f"remote {host} {port}", "resolv-retry infinite", "nobind",
-                         "persist-key", "persist-tun", "remote-cert-tls server"]
-                for option, value in openvpn_options.items():
-                    name = str(option).strip().lower()
-                    if name in {"dev", "proto", "remote", "auth-user-pass", "script-security", "up", "down"}:
+                endpoints = []
+                for transport in caps.get("transport") or []:
+                    if str(transport.get("type", "")).lower() == "openvpn":
+                        for proto in transport.get("protocols", ["udp"]):
+                            for port in transport.get("ports", []):
+                                endpoints.append((str(proto).lower(), int(port)))
+                if not endpoints and "ports" in caps:
+                    for proto in caps.get("protocols", ["udp"]):
+                        for port in caps.get("ports", []):
+                            endpoints.append((str(proto).lower(), int(port)))
+
+                location = gateway.get("location") or "Unknown"
+                info = locations.get(location, {}) if isinstance(locations, dict) else {}
+                country = info.get("name") or location
+                country_code = normalize_country_code(info.get("country_code"))
+                for proto, port in endpoints:
+                    if proto not in {"tcp", "udp"} or not 1 <= port <= 65535:
                         continue
-                    if isinstance(value, bool):
-                        if value:
-                            lines.append(name)
-                    elif value is not None and str(value).strip():
-                        lines.append(f"{name} {value}")
-                lines.extend(["<ca>", ca_pem, "</ca>", "<cert>", client_cert, "</cert>",
-                              "<key>", client_key, "</key>"])
-                candidates.append({"ovpn_text": "\n".join(lines) + "\n", "country": country,
-                                   "country_code": cc, "source": source_slug, "username": "",
-                                   "password": "", "requires_auth": False, "publishable": True})
+                    lines = [
+                        "client", "dev tun",
+                        f"proto {proto}-client" if proto == "tcp" else "proto udp",
+                        f"remote {host} {port}", "resolv-retry infinite", "nobind",
+                        "persist-key", "persist-tun", "remote-cert-tls server",
+                    ]
+                    for option, value in openvpn_options.items():
+                        name = str(option).strip().lower()
+                        if name in {"dev", "proto", "remote", "auth-user-pass", "script-security", "up", "down"}:
+                            continue
+                        if isinstance(value, bool):
+                            if value:
+                                lines.append(name)
+                        elif value is not None and str(value).strip():
+                            lines.append(f"{name} {value}")
+                    lines.extend([
+                        "<ca>", ca_pem, "</ca>", "<cert>", client_cert, "</cert>",
+                        "<key>", client_key, "</key>",
+                    ])
+                    candidates.append({
+                        "ovpn_text": "\\n".join(lines) + "\\n",
+                        "country": country, "country_code": country_code,
+                        "source": source_slug, "username": "", "password": "",
+                        "requires_auth": False, "publishable": True,
+                    })
         print(f"{provider_name}: collected {len(candidates)} public OpenVPN gateway profiles")
     except Exception as exc:
         print(f"{provider_name} Error: {exc}")
