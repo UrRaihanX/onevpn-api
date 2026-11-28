@@ -359,7 +359,7 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
         with tempfile.TemporaryDirectory(prefix=f"onevpn-{source_slug}-ca-") as temp_dir:
             ca_path = os.path.join(temp_dir, "provider-ca.pem")
             with open(ca_path, "w", encoding="utf-8") as handle:
-                handle.write(ca_pem + "\\n")
+                handle.write(ca_pem + "\n")
 
             gateways_response = requests.get(
                 f"{api}/3/config/eip-service.json", headers=HEADERS,
@@ -432,7 +432,7 @@ def fetch_bitmask_provider(provider_name: str, api_base: str, ca_url: str, sourc
                         "<key>", client_key, "</key>",
                     ])
                     candidates.append({
-                        "ovpn_text": "\\n".join(lines) + "\\n",
+                        "ovpn_text": "\n".join(lines) + "\n",
                         "country": country, "country_code": country_code,
                         "source": source_slug, "username": "", "password": "",
                         "requires_auth": False, "publishable": True,
