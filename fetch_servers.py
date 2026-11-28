@@ -841,16 +841,17 @@ def run_end_to_end_checks(healthy_servers: list):
     """Test one real TCP and one real UDP tunnel when candidates are available."""
     if os.environ.get("RUN_E2E_TESTS", "1").strip().lower() in {"0", "false", "no"}:
         print("VPN E2E checks disabled by RUN_E2E_TESTS.")
-        return
+        return healthy_servers
     if not healthy_servers:
         print("VPN E2E checks skipped: no health-checked servers.")
-        return
+        return healthy_servers
     if not install_openvpn_client():
         print("VPN E2E checks skipped because the OpenVPN client is unavailable; continuing other sources.")
-        return
+        return healthy_servers
 
     passed = 0
     checked = 0
+    failed_groups = set()
 
     # Exercise each provider independently so one provider's success cannot mask
     # broken credentials, endpoint metadata, or profile generation from another.
@@ -874,12 +875,16 @@ def run_end_to_end_checks(healthy_servers: list):
                 protocol_passed = True
                 break
         if not protocol_passed:
+            failed_groups.add((source, proto))
             print(f"{source.upper()} E2E FAIL: no working {proto.upper()} tunnel "
                   f"found in {min(len(candidates), 2)} attempted endpoint(s).")
 
     print(f"VPN E2E summary: {passed}/{checked} provider/protocol checks passed.")
-    if passed != checked:
-        print("VPN E2E warning: one or more source tunnels failed; healthy servers from other sources will still be processed.")
+    if failed_groups:
+        before = len(healthy_servers)
+        healthy_servers = [server for server in healthy_servers if (str(server.get("source", "")).lower(), server.get("protocol")) not in failed_groups]
+        print(f"Excluded {before - len(healthy_servers)} servers from failed E2E source/protocol groups.")
+    return healthy_servers
 
 def process_server(item):
     alive, ping_ms = check_server_health(
