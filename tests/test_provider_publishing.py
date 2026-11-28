@@ -134,6 +134,43 @@ KEY
         patched = fetch_servers.patch_ovpn_config("client\ncipher AES-128-CBC\n", False)
         self.assertIn("data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305", patched)
         self.assertIn("data-ciphers-fallback AES-128-CBC", patched)
+    def test_leap_provider_emits_both_udp_and_tcp_profiles(self):
+        provider = mock.Mock()
+        provider.json.return_value = {
+            "api_uri": "https://riseup.example",
+            "api_version": "3",
+            "ca_cert_uri": "https://riseup.example/ca.crt",
+        }
+        ca = mock.Mock(text="-----BEGIN CERTIFICATE-----\\nCA\\n-----END CERTIFICATE-----")
+        gateways = mock.Mock()
+        gateways.json.return_value = {
+            "gateways": [{
+                "ip_address": "198.51.100.10",
+                "location": "test",
+                "capabilities": {"transport": [{
+                    "type": "openvpn",
+                    "protocols": ["udp", "tcp"],
+                    "ports": [1194, 443],
+                }]},
+            }],
+            "locations": {},
+            "openvpn_configuration": {},
+        }
+        cert = mock.Mock(text=(
+            "-----BEGIN CERTIFICATE-----\\nCLIENT\\n-----END CERTIFICATE-----\\n"
+            "-----BEGIN PRIVATE KEY-----\\nKEY\\n-----END PRIVATE KEY-----"
+        ))
+        for response in (provider, ca, gateways, cert):
+            response.raise_for_status.return_value = None
+        with mock.patch.object(fetch_servers.requests, "get",
+                               side_effect=(provider, ca, gateways, cert)):
+            profiles = fetch_servers.fetch_leap_provider(
+                "RiseupVPN", "https://riseup.example/provider.json", "riseup"
+            )
+        self.assertEqual({fetch_servers.extract_server_endpoint(p["ovpn_text"])[2]
+                          for p in profiles}, {"udp", "tcp"})
+        self.assertEqual(len(profiles), 2)
+
     def test_private_or_unknown_source_is_rejected(self):
         record = {
             "source": "unknown", "_publishable": True,
