@@ -722,14 +722,15 @@ def run_openvpn_end_to_end(item: dict):
                 except Exception:
                     pass
             try:
+                openvpn_pid = ""
                 if os.path.exists(pid_path):
                     with open(pid_path, "r", encoding="utf-8") as handle:
                         openvpn_pid = handle.read().strip()
-                    if openvpn_pid.isdigit():
-                        subprocess.run(
-                            ["sudo", "kill", "-TERM", openvpn_pid],
-                            capture_output=True, timeout=5,
-                        )
+                if openvpn_pid.isdigit():
+                    subprocess.run(
+                        ["sudo", "kill", "-TERM", openvpn_pid],
+                        capture_output=True, timeout=5,
+                    )
                 elif process and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
