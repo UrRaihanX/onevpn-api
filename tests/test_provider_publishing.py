@@ -82,7 +82,7 @@ KEY
                 return b"\x20"
             def close(self): pass
         fake = FakeSocket()
-        ticks = iter([0.0, 1.6, 2.0, 2.025])
+        ticks = iter([0.0, 1.5, 1.525])
         with mock.patch.object(fetch_servers.socket, "socket", return_value=fake), \
              mock.patch.object(fetch_servers.time, "monotonic", side_effect=lambda: next(ticks)), \
              mock.patch.object(fetch_servers.os, "urandom", return_value=b"12345678"):

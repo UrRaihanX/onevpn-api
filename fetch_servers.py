@@ -430,6 +430,16 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
         for gateway in gateways:
             capabilities = gateway.get("capabilities", {}) or {}
             transports = capabilities.get("transport", []) or []
+            openvpn_transports = [item for item in transports if str(item.get("type", "")).lower() == "openvpn"]
+            if openvpn_transports:
+                merged_protocols = []
+                merged_ports = []
+                for item in openvpn_transports:
+                    values = item.get("protocols") or [item.get("protocol", "")]
+                    merged_protocols.extend(str(value).lower() for value in values if str(value).lower() in {"udp", "tcp"})
+                    ports = item.get("ports", []) or []
+                    merged_ports.extend(ports if isinstance(ports, list) else [ports])
+                transports = [{"type": "openvpn", "protocols": merged_protocols, "ports": merged_ports}]
             for transport in transports:
                 if str(transport.get("type", "")).lower() != "openvpn":
                     continue
