@@ -105,7 +105,7 @@ KEY
         self.assertEqual(results[0]["speed_mbps"], 25.0)
 
     def test_endpoint_deduplication_prefers_approved_source(self):
-        profile = "client\\nremote 198.51.100.1 1194 udp\\n"
+        profile = "client\nremote 198.51.100.1 1194 udp\n"
         records = [
             {"ovpn_text": profile, "source": "fox3000foxy/OVPN-Configs-scraper"},
             {"ovpn_text": profile, "source": "VPNGate"},
