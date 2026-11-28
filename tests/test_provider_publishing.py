@@ -70,6 +70,16 @@ KEY
             self.assertEqual(payload["total_servers"], 3)
             self.assertEqual(len(os.listdir(os.path.join(output, "configs"))), 3)
 
+    def test_tcp_ping_uses_connect_rtt_not_openvpn_reply_delay(self):
+        fake = mock.MagicMock()
+        fake.__enter__.return_value = fake
+        fake.recv.side_effect = [b"\\x00\\x01", b"\\x20"]
+        with mock.patch.object(fetch_servers.socket, "create_connection", return_value=fake), \\
+             mock.patch.object(fetch_servers.time, "monotonic", side_effect=[10.0, 10.075]):
+            alive, ping = fetch_servers.check_tcp_health("198.51.100.1", 443)
+        self.assertTrue(alive)
+        self.assertEqual(ping, 75)
+
     def test_udp_probe_packet_format_and_retry_rtt(self):
         class FakeSocket:
             def __init__(self): self.sent = []; self.calls = 0
