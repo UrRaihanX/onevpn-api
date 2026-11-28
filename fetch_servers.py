@@ -676,7 +676,7 @@ def run_end_to_end_checks(healthy_servers: list):
         print("VPN E2E checks skipped: no health-checked servers.")
         return
     if not install_openvpn_client():
-        return
+        raise RuntimeError("VPN E2E cannot run because the OpenVPN client is unavailable.")
 
     passed = 0
     checked = 0
@@ -710,8 +710,12 @@ def run_end_to_end_checks(healthy_servers: list):
     present_sources = {source for source, _ in grouped}
     missing_sources = expected_sources - present_sources
     for source in sorted(missing_sources):
-        print(f"{source.upper()} E2E SKIPPED: no health-checked publishable endpoints.")
+        print(f"{source.upper()} E2E FAIL: no health-checked publishable endpoints.")
     print(f"VPN E2E summary: {passed}/{checked} provider/protocol checks passed.")
+    if missing_sources or passed != checked:
+        raise RuntimeError(
+            "VPN E2E failed or an approved provider had no live endpoint; public feed was not updated."
+        )
 
 def process_server(item):
     alive, ping_ms = check_server_health(
