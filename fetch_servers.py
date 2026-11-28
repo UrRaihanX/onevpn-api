@@ -12,6 +12,7 @@ import threading
 import subprocess
 import tempfile
 import ipaddress
+from urllib.parse import quote
 import requests
 from io import StringIO
 from collections import Counter
@@ -136,11 +137,13 @@ def extract_server_endpoint(ovpn_text: str):
     return ip, port, proto, has_tls_key
 
 
-def check_tcp_health(ip: str, port: int):
-    """Require an OpenVPN TCP control-channel response, not merely an open TCP port."""
+def check_tcp_health(ip: str, port: int, has_tls_key: bool = False):
+    """Check TCP reachability; TLS-keyed listeners cannot answer unauthenticated probes."""
     start_time = time.monotonic()
     try:
         with socket.create_connection((ip, port), timeout=HEALTH_CHECK_TIMEOUT) as sock:
+            if has_tls_key:
+                return True, max(1, int((time.monotonic() - start_time) * 1000))
             sock.settimeout(HEALTH_CHECK_TIMEOUT)
             # TCP transport frames each OpenVPN packet with a 2-byte network-order length.
             session_id = os.urandom(8)
@@ -179,16 +182,20 @@ def check_tcp_health(ip: str, port: int):
 
 def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
     """OpenVPN UDP control-channel probe; retry before declaring the endpoint unreachable."""
-    start_time = time.monotonic()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(min(HEALTH_CHECK_TIMEOUT, 1.5))
     try:
         sock.connect((ip, port))
-        # OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2:
-        # opcode/key-id, 8-byte session-id, 4-byte packet-id, ack-count.
+        # TLS-keyed servers silently discard unauthenticated hard resets.
+        # Their authenticated profiles are verified by the OpenVPN E2E check.
+        if has_tls_key:
+            started = time.monotonic()
+            sock.send(b"\x38" + os.urandom(8) + b"\x00" + (1).to_bytes(4, "big"))
+            return True, max(1, int((time.monotonic() - started) * 1000))
         session_id = os.urandom(8)
         for packet_id in range(1, 4):
-            probe_packet = b"\x38" + session_id + packet_id.to_bytes(4, "big") + b"\x00"
+            start_time = time.monotonic()
+            probe_packet = b"\x38" + session_id + b"\x00" + packet_id.to_bytes(4, "big")
             try:
                 sock.send(probe_packet)
                 data = sock.recv(2048)
@@ -209,7 +216,7 @@ def check_udp_health(ip: str, port: int, has_tls_key: bool = False):
 
 def check_server_health(ip: str, port: int, proto: str, has_tls_key: bool = False):
     if proto == "tcp":
-        return check_tcp_health(ip, port)
+        return check_tcp_health(ip, port, has_tls_key=has_tls_key)
     return check_udp_health(ip, port, has_tls_key=has_tls_key)
 
 
@@ -274,9 +281,9 @@ def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
             if directive not in seen:
                 # Use the requested compatibility set consistently across providers.
                 value = (
-                    "AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"
+                    "AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305"
                     if directive == "data-ciphers"
-                    else "AES-128-CBC"
+                    else "AES-256-CBC:AES-128-CBC"
                 )
                 output.append(f"{directive} {value}")
                 seen.add(directive)
@@ -285,8 +292,8 @@ def patch_ovpn_config(ovpn_text: str, requires_auth: bool) -> str:
         seen.add(directive)
 
     required = [
-        ('data-ciphers', "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC:CHACHA20-POLY1305"),
-        ('data-ciphers-fallback', "data-ciphers-fallback AES-128-CBC"),
+        ('data-ciphers', "data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:CHACHA20-POLY1305"),
+        ('data-ciphers-fallback', "data-ciphers-fallback AES-256-CBC:AES-128-CBC"),
         ('pull-filter-route-ipv6', 'pull-filter ignore "route-ipv6"'),
         ('pull-filter-ifconfig-ipv6', 'pull-filter ignore "ifconfig-ipv6"'),
         ('dhcp-option-dns-1.1.1.1', "dhcp-option DNS 1.1.1.1"),
@@ -329,7 +336,13 @@ def fetch_vpngate():
                 continue
             try:
                 ovpn_text = base64.b64decode(row[14]).decode("utf-8", errors="ignore")
+                try:
+                    speed_mbps = round(float(row[4]) / 1_000_000, 2)
+                    if speed_mbps < 0: speed_mbps = 0.0
+                except (TypeError, ValueError, IndexError):
+                    speed_mbps = 0.0
                 candidates.append({
+                    "speed_mbps": speed_mbps,
                     "ovpn_text": ovpn_text,
                     "country": row[5] or "Unknown",
                     "country_code": normalize_country_code(row[6]),
@@ -454,7 +467,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
                     continue
                 location = gateway.get("location") or "Unknown"
                 location_info = locations.get(location, {}) if isinstance(locations, dict) else {}
-                country = location_info.get("name") or location
+                country = ""
                 country_code = normalize_country_code(location_info.get("country_code"))
 
                 lines = [
@@ -526,17 +539,20 @@ def fetch_calyx():
 def fetch_github_ovpn_repository(repository: str, source_name: str):
     """Fetch public .ovpn files from a GitHub repository using only requests."""
     candidates = []
+    github_headers = dict(HEADERS)
+    if os.environ.get("GITHUB_TOKEN"):
+        github_headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
     try:
         repo_response = requests.get(
             f"https://api.github.com/repos/{repository}",
-            headers=HEADERS, timeout=(8, 20),
+            headers=github_headers, timeout=(8, 20),
         )
         repo_response.raise_for_status()
         default_branch = repo_response.json().get("default_branch") or "main"
 
         tree_response = requests.get(
             f"https://api.github.com/repos/{repository}/git/trees/{default_branch}?recursive=1",
-            headers=HEADERS, timeout=(8, 30),
+            headers=github_headers, timeout=(8, 30),
         )
         tree_response.raise_for_status()
         tree = tree_response.json()
@@ -550,34 +566,19 @@ def fetch_github_ovpn_repository(repository: str, source_name: str):
             and entry.get("path", "").lower().endswith(".ovpn")
         ][:100]
 
-        for path in paths:
+        def download_profile(path):
             try:
-                raw_url = (
-                    f"https://raw.githubusercontent.com/{repository}/"
-                    f"{default_branch}/{path}"
-                )
-                profile_response = requests.get(
-                    raw_url, headers=HEADERS, timeout=(8, 20),
-                )
-                profile_response.raise_for_status()
-                profile = profile_response.text
-                if re.search(r"(?im)^\s*remote\s+\S+\s+\d+", profile) and re.search(
-                    r"(?im)^\s*dev\s+\S+", profile
-                ):
-                    candidates.append({
-                        "ovpn_text": profile,
-                        "country": "Unknown",
-                        "country_code": "XX",
-                        "source": source_name,
-                        "username": "",
-                        "password": "",
-                        "requires_auth": bool(re.search(
-                            r"(?im)^\s*auth-user-pass(?:\s|$)", profile
-                        )),
-                        "publishable": True,
-                    })
+                raw_url = f"https://raw.githubusercontent.com/{repository}/{quote(default_branch, safe='')}/{quote(path, safe='/')}"
+                response = requests.get(raw_url, headers=github_headers, timeout=(8, 20))
+                response.raise_for_status()
+                profile = response.text
+                if re.search(r"(?im)^\\s*remote\\s+\\S+\\s+\\d+", profile) and re.search(r"(?im)^\\s*dev\\s+\\S+", profile):
+                    return {"ovpn_text": profile, "country": "Unknown", "country_code": "XX", "source": source_name, "username": "", "password": "", "requires_auth": bool(re.search(r"(?im)^\\s*auth-user-pass(?:\\s|$)", profile)), "publishable": True}
             except Exception as exc:
                 print(f"{source_name}: skipped {path}: {exc}")
+            return None
+        with ThreadPoolExecutor(max_workers=min(12, max(1, len(paths)))) as pool:
+            candidates.extend(item for item in pool.map(download_profile, paths) if item)
     except Exception as exc:
         print(f"{source_name} Error: {exc}")
     print(f"{source_name}: collected {len(candidates)} public .ovpn profiles")
@@ -599,17 +600,17 @@ def install_openvpn_client():
         return False
     try:
         update = subprocess.run(
-            ["sudo", "apt-get", "update", "-qq"],
+            ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq"],
             capture_output=True, text=True, timeout=120,
         )
         if update.returncode != 0:
             print("VPN E2E skipped: package index update failed.")
             return False
         install = subprocess.run(
-            ["sudo", "apt-get", "install", "-y", "-qq", "openvpn", "curl", "iproute2"],
+            ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", "openvpn", "curl", "iproute2"],
             capture_output=True, text=True, timeout=180,
         )
-        if install.returncode != 0 or not shutil.which("openvpn"):
+        if install.returncode != 0 or not all(shutil.which(x) for x in ("openvpn", "ip", "curl")):
             print("VPN E2E skipped: OpenVPN client installation failed.")
             return False
         return True
@@ -757,7 +758,10 @@ def run_openvpn_end_to_end(item: dict):
                 return False, "OpenVPN connected but no TUN interface was found"
             tun_device = match.group(1)
 
-            route_ip = socket.gethostbyname("api.ipify.org")
+            try:
+                route_ip = socket.gethostbyname("api.ipify.org")
+            except OSError as exc:
+                return False, f"could not resolve api.ipify.org: {exc}"
             route_result = subprocess.run(
                 ["sudo", "ip", "route", "add", f"{route_ip}/32", "dev", tun_device],
                 capture_output=True, text=True, timeout=5,
@@ -902,6 +906,7 @@ def process_server(item):
         "flag_url": country_code_to_flag_url(cc),
         "isp": "Unknown",
         "ping_ms": ping_ms,
+        "speed_mbps": float(item.get("speed_mbps", 0.0) or 0.0),
         "source": item["source"],
         "_publishable": bool(item.get("publishable", True)),
         "username": item.get("username", ""),
@@ -923,29 +928,26 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
                 f"Refusing to publish non-approved/private source: {server.get('source', 'unknown')}"
             )
         # Embedded client keys are required by these providers' OpenVPN profiles.
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
-    configs_dir = os.path.join(output_dir, "configs")
+    parent_dir = os.path.dirname(os.path.abspath(output_dir))
+    os.makedirs(parent_dir, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(prefix=".onevpn-staging-", dir=parent_dir)
+    backup_dir = None
+    configs_dir = os.path.join(staging_dir, "configs")
     os.makedirs(configs_dir, exist_ok=True)
 
     now_unix = int(time.time())
     meta_servers = []
     full_servers = []
 
-    for server in healthy_servers:
-        if not server.get("_publishable", True):
-            raise ValueError("Refusing to publish a profile marked private/non-publishable")
-        ovpn_text = server.pop("_ovpn_text")
-        server.pop("_publishable", None)
-        ovpn_file = os.path.join(output_dir, server["config_path"])
+    for original in healthy_servers:
+        server = {key: value for key, value in original.items() if key not in {"_ovpn_text", "_publishable"}}
+        ovpn_text = original["_ovpn_text"]
+        ovpn_file = os.path.join(staging_dir, server["config_path"])
+        os.makedirs(os.path.dirname(ovpn_file), exist_ok=True)
         with open(ovpn_file, "w", encoding="utf-8") as f:
             f.write(ovpn_text)
-
         meta_servers.append(server)
-        full_servers.append({
-            **server,
-            "ovpn_base64": base64.b64encode(ovpn_text.encode("utf-8")).decode("utf-8"),
-        })
+        full_servers.append({**server, "ovpn_base64": base64.b64encode(ovpn_text.encode("utf-8")).decode("utf-8")})
 
     meta_payload = {
         "app": "OneVPN",
@@ -962,11 +964,21 @@ def write_output_bundle(healthy_servers: list, output_dir: str) -> None:
         "servers": full_servers,
     }
 
-    with open(os.path.join(output_dir, "servers_meta.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(staging_dir, "servers_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta_payload, f, separators=(",", ":"), ensure_ascii=False)
-
-    with open(os.path.join(output_dir, "servers.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(staging_dir, "servers.json"), "w", encoding="utf-8") as f:
         json.dump(full_payload, f, separators=(",", ":"), ensure_ascii=False)
+    try:
+        if os.path.exists(output_dir):
+            backup_dir = output_dir + ".backup-" + str(os.getpid())
+            os.replace(output_dir, backup_dir)
+        os.replace(staging_dir, output_dir)
+        if backup_dir and os.path.exists(backup_dir): shutil.rmtree(backup_dir)
+    except Exception:
+        if backup_dir and os.path.exists(backup_dir) and not os.path.exists(output_dir): os.replace(backup_dir, output_dir)
+        raise
+    finally:
+        if os.path.exists(staging_dir): shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def main():
@@ -997,16 +1009,17 @@ def main():
     raw_counts = Counter(item["source"] for item in raw_candidates)
     print(f"Fetched raw candidates by source: {dict(raw_counts)}")
 
+    source_priority = {"vpngate": 0, "riseup": 1, "calyx": 2, "fox3000foxy/ovpn-configs-scraper": 3}
     unique_map = {}
     for item in raw_candidates:
         ip, port, proto, has_tls_key = extract_server_endpoint(item["ovpn_text"])
-        key = (str(item.get("source", "")).lower(), ip, port, proto)
-        if ip and key not in unique_map:
-            item["ip"] = ip
-            item["port"] = port
-            item["protocol"] = proto
-            item["has_tls_key"] = has_tls_key
-            unique_map[key] = item
+        if not ip: continue
+        key = (ip, port, proto)
+        item.update({"ip": ip, "port": port, "protocol": proto, "has_tls_key": has_tls_key})
+        previous = unique_map.get(key)
+        priority = source_priority.get(str(item.get("source", "")).lower(), 99)
+        old_priority = source_priority.get(str(previous.get("source", "")).lower(), 100) if previous else 100
+        if previous is None or priority < old_priority: unique_map[key] = item
 
     print(f"Checking health for {len(unique_map)} unique endpoints (TCP + UDP)...")
     healthy_servers = []
@@ -1018,11 +1031,11 @@ def main():
     live_counts = Counter(s["source"] for s in healthy_servers)
     print(f"Live servers by source: {dict(live_counts)}")
 
-    run_end_to_end_checks(healthy_servers)
+    healthy_servers = run_end_to_end_checks(healthy_servers)
 
     publishable_servers = [server for server in healthy_servers if server.get("_publishable", True)]
-    isolated_riseup_count = len(healthy_servers) - len(publishable_servers)
-    print(f"Publication filter: excluded {isolated_riseup_count} profiles marked private/non-publishable.")
+    source_counts = Counter(str(server.get("source", "")).lower() for server in publishable_servers)
+    print("Per-source publishable servers: " + ", ".join(f"{label}={source_counts.get(slug, 0)}" for label, slug in (("VPNGate", "vpngate"), ("RiseupVPN", "riseup"), ("CalyxVPN", "calyx"), ("fox3000foxy", "fox3000foxy/ovpn-configs-scraper"))))
 
     if len(publishable_servers) < MIN_SERVERS_THRESHOLD:
         print(
@@ -1031,7 +1044,6 @@ def main():
         )
         return
 
-    source_counts = Counter(str(server.get("source", "")).lower() for server in publishable_servers)
     print(f"Running GeoIP lookup for {len(publishable_servers)} publishable live servers...")
     enrich_with_geoip(publishable_servers)
 

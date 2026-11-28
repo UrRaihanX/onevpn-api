@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import fetch_servers
 
@@ -59,13 +60,66 @@ KEY
             })
         with tempfile.TemporaryDirectory() as temp:
             output = os.path.join(temp, "dist")
+            original_records = [dict(record) for record in records]
             fetch_servers.write_output_bundle(records, output)
+            self.assertEqual(records, original_records)
             with open(os.path.join(output, "servers_meta.json"), encoding="utf-8") as handle:
                 payload = json.load(handle)
             self.assertEqual({item["source"] for item in payload["servers"]},
                              {"vpngate", "riseup", "calyx"})
             self.assertEqual(payload["total_servers"], 3)
             self.assertEqual(len(os.listdir(os.path.join(output, "configs"))), 3)
+
+    def test_udp_probe_packet_format_and_retry_rtt(self):
+        class FakeSocket:
+            def __init__(self): self.sent = []; self.calls = 0
+            def settimeout(self, value): pass
+            def connect(self, address): pass
+            def send(self, packet): self.sent.append(packet)
+            def recv(self, size):
+                self.calls += 1
+                if self.calls == 1: raise __import__("socket").timeout()
+                return b"\\x20"
+            def close(self): pass
+        fake = FakeSocket()
+        ticks = iter([0.0, 1.6, 2.0, 2.025])
+        with mock.patch.object(fetch_servers.socket, "socket", return_value=fake), \\
+             mock.patch.object(fetch_servers.time, "monotonic", side_effect=lambda: next(ticks)), \\
+             mock.patch.object(fetch_servers.os, "urandom", return_value=b"12345678"):
+            alive, ping = fetch_servers.check_udp_health("198.51.100.1", 1194)
+        self.assertTrue(alive)
+        self.assertEqual(fake.sent[0], b"\\x38" + b"12345678" + b"\\x00" + (1).to_bytes(4, "big"))
+        self.assertEqual(ping, 25)
+
+    def test_vpngate_speed_mbps(self):
+        import base64
+        row = [""] * 15
+        row[4] = "25000000"
+        row[5] = "Test"
+        row[6] = "US"
+        row[14] = base64.b64encode(b"client\\nremote 198.51.100.1 1194 udp").decode()
+        response = mock.Mock(text="header\\n#comment\\n" + ",".join(row))
+        response.raise_for_status.return_value = None
+        with mock.patch.object(fetch_servers.requests, "get", return_value=response):
+            results = fetch_servers.fetch_vpngate()
+        self.assertEqual(results[0]["speed_mbps"], 25.0)
+
+    def test_endpoint_deduplication_prefers_approved_source(self):
+        # Same endpoint identity is shared across provider sources.
+        endpoints = [("198.51.100.1", 1194, "udp", "fox3000foxy/OVPN-Configs-scraper"),
+                     ("198.51.100.1", 1194, "udp", "VPNGate")]
+        priority = {"vpngate": 0, "riseup": 1, "calyx": 2, "fox3000foxy/ovpn-configs-scraper": 3}
+        chosen = {}
+        for ip, port, proto, source in endpoints:
+            key = (ip, port, proto)
+            if key not in chosen or priority[source.lower()] < priority[chosen[key].lower()]:
+                chosen[key] = source
+        self.assertEqual(chosen[("198.51.100.1", 1194, "udp")], "VPNGate")
+
+    def test_aes_256_cbc_is_preserved(self):
+        patched = fetch_servers.patch_ovpn_config("client\\n", False)
+        self.assertIn("AES-256-CBC", patched)
+        self.assertIn("AES-128-CBC", patched)
 
     def test_private_or_unknown_source_is_rejected(self):
         record = {

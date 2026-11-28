@@ -70,6 +70,4 @@ jobs:
           fi
           curl -fsSL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/servers_meta.json" || true
           curl -fsSL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/servers.json" || true
-          jq -r '.servers[].config_path' dist/servers_meta.json | while read -r config_path; do
-            curl -fsSL "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/$config_path" >/dev/null || true
-          done
+          jq -r '.servers[].config_path' dist/servers_meta.json | xargs -r -P 8 -I {} curl -fsSL --max-time 10 "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@data/{}" -o /dev/null || true
