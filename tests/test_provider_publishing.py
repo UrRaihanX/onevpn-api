@@ -63,8 +63,8 @@ class ProviderPublishingTests(unittest.TestCase):
         with mock.patch.dict(os.environ,{"RUN_E2E_TESTS":"1"}), \
              mock.patch.object(fetch_servers,"install_openvpn_client",return_value=True), \
              mock.patch.object(fetch_servers,"run_openvpn_end_to_end",
-                 side_effect=lambda item: (item["source"] == "vpngate",
-                     "verified" if item["source"] == "vpngate" else "AUTH_FAILED: invalid certificate")) as attempt:
+                 side_effect=lambda item: (item["protocol"] == "tcp",
+                     "verified" if item["protocol"] == "tcp" else "AUTH_FAILED: invalid certificate") as attempt:
             result=fetch_servers.run_end_to_end_checks(broken+[survivor])
         self.assertEqual([x["id"] for x in result],[survivor["id"]])
         self.assertEqual(attempt.call_count,4)
