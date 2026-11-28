@@ -365,9 +365,20 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
     candidates = []
     ca_path = None
     try:
-        provider_response = requests.get(provider_url, headers=HEADERS, timeout=(8, 20))
-        provider_response.raise_for_status()
-        provider = provider_response.json()
+        try:
+            provider_response = requests.get(provider_url, headers=HEADERS, timeout=(8, 20))
+            provider_response.raise_for_status()
+            provider = provider_response.json()
+        except Exception:
+            if source_slug != "calyx":
+                raise
+            # Calyx's legacy provider.json currently returns 404; retain its
+            # documented LEAP API bootstrap endpoints as a fallback.
+            provider = {
+                "api_uri": "https://api.calyx.net:4430",
+                "api_version": "3",
+                "ca_cert_uri": "https://calyx.net/ca.crt",
+            }
 
         api_uri = str(provider["api_uri"]).rstrip("/")
         api_version = str(provider.get("api_version", "3") or "3").strip("/")
@@ -402,7 +413,7 @@ def fetch_leap_provider(provider_name: str, provider_url: str, source_slug: str)
 
         # Request one shared client credential bundle per provider, not per gateway.
         cert_response = requests.get(
-            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=ca_path,
+            f"{api_root}/cert", headers=HEADERS, timeout=(8, 30), verify=True,
         )
         cert_response.raise_for_status()
         cert_bundle = cert_response.text
