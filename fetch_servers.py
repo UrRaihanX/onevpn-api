@@ -758,7 +758,7 @@ def run_openvpn_end_to_end(item: dict):
     if not profile:
         return False, reason
     needs_auth = bool(re.search(
-        r"(?im)^\\s*auth-user-pass(?:\\s|$)|<auth-user-pass>",
+        r"(?im)^\s*auth-user-pass(?:\s|$)|<auth-user-pass>",
         item["_ovpn_text"],
     ))
     username = str(item.get("username") or "")
