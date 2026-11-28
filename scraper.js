@@ -21,7 +21,27 @@ function toProfile(body, source) {
 async function fetchConfig(url, source) {
   try {
     const response = await client.get(url, { responseType: "text" });
-    return toProfile(response.data, source);
+    const direct = toProfile(response.data, source);
+    if (direct) return direct;
+    const contentType = String((response.headers && response.headers["content-type"]) || "");
+    if (!contentType.includes("html") && !/<(?:html|!doctype)/i.test(String(response.data).slice(0, 500))) return null;
+    const $ = cheerio.load(response.data);
+    const links = new Set();
+    $("a[href]").each((_, node) => {
+      const href = $(node).attr("href");
+      const label = $(node).text().toLowerCase();
+      if (href && (/\\.ovpn(?:$|[?#])/i.test(href) || /(download|config|openvpn)/.test(label))) {
+        try { links.add(new URL(href, url).href); } catch (_) {}
+      }
+    });
+    for (const link of Array.from(links).slice(0, 5)) {
+      try {
+        const file = await client.get(link, { responseType: "text" });
+        const item = toProfile(file.data, source);
+        if (item) return item;
+      } catch (_) {}
+    }
+    return null;
   } catch (error) {
     console.log(source + ": download failed (" +
       ((error.response && error.response.status) || error.code || error.message) + ")");
